@@ -5,7 +5,7 @@ description: Operate Funx platform functions with the Funx CLI. Use when choosin
 
 # Funx 平台函数：CLI 与 CI
 
-只在改「平台自己」时用这份技能：`funx-api`、`funx-runtime`、`funx-router`。用户 worker 走 [worker-cli](../worker-cli/SKILL.md)，用 `funx deploy`，不要用这里的命令。
+只在改「平台自己」时用这份技能：`funx-api`、`funx-runtime`、`funx-router`。用户 worker 走 [worker-cli](../worker-cli/SKILL.md)（再指向 funx-site/skill 与 funx-site/cli），不要用这里的平台命令。
 
 安装与入口见 [cli/README.md](../../cli/README.md)。权限边界的文字规则在 [.github/workflows/deploy.yml](../../.github/workflows/deploy.yml)，尚未接线。
 

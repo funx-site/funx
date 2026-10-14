@@ -2,7 +2,7 @@
 
 `funx` 把一个 Workers 风格的 worker 部署到 `https://<name>.funx.run`。仓库里的入口是 `cli/funx.js`。`package.json` 的 `bin.funx` 指向这个文件。
 
-计划中的 npm 包名是 `@funx-site/cli`，命令名仍是 `funx`。包还没有发布。不要执行 `npm publish`，也不要用 `npx @funx-site/cli` 去注册表安装。当前 `package.json` 的 `name` 仍是仓库内的 `funx-mvp`，并且 `private: true`。
+用户和 agent 用的公开包是 sibling 仓库 [funx-site/cli](https://github.com/funx-site/cli)（`@funx-site/cli`，尚未发布），skill 是 [funx-site/skill](https://github.com/funx-site/skill)。本目录是平台仓库里的操作者入口。当前 `package.json` 的 `name` 仍是 `funx-mvp`，并且 `private: true`。不要从这里执行 `npm publish`。
 
 ## 直接用 node
 
@@ -46,4 +46,4 @@ npx --package=. -- funx --help
 
 需要云的命令使用环境变量里的 STS（`TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY` / `TENCENTCLOUD_SESSION_TOKEN`）和 `FUNX_DEPLOY_KEY`。不要把这些值写进 git、聊天或日志。密钥用 `funx secret put` 从 stdin 读入，CLI 不打印明文，也不打印函数 URL。
 
-Agent 用法见 [AGENTS.md](../AGENTS.md)、[skills/worker-cli/SKILL.md](../skills/worker-cli/SKILL.md) 和 [skills/platform-ops-cli/SKILL.md](../skills/platform-ops-cli/SKILL.md)。
+用户 / agent 部署见 [funx-site/skill](https://github.com/funx-site/skill) 与 [funx-site/cli](https://github.com/funx-site/cli)。本仓库指针是 [skills/worker-cli/SKILL.md](../skills/worker-cli/SKILL.md)。平台函数见 [AGENTS.md](../AGENTS.md) 和 [skills/platform-ops-cli/SKILL.md](../skills/platform-ops-cli/SKILL.md)。
