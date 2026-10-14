@@ -1,0 +1,60 @@
+name: deploy
+
+# Manual skeleton only. deploy-develop and promote do not call any cloud API.
+# Variable names are listed below; this repo stores no values and no Actions secrets.
+# id-token is intentionally not requested. Do not wire OIDC, CAM, or COS
+# until cloud architecture has reviewed the permission list in this file.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: deploy-develop or promote (not wired; this run will fail)
+        type: choice
+        options: [deploy-develop, promote]
+        default: deploy-develop
+      version:
+        description: promote target version number (unused)
+        required: false
+
+# Draft permission list for review. Not applied.
+# Allow, tagged codename=funx only:
+#   scf:UpdateFunctionCode, scf:PublishVersion, scf:UpdateAlias,
+#   read-only List*, upload to the deploy prefix in object storage.
+# Deny:
+#   scf:Invoke, scf:GetFunction, scf:UpdateFunctionConfiguration, scf:UpdateFunction,
+#   scf:Create*, scf:Delete*, triggers, domain changes, tag:*, cam:*, sts:*.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  skeleton:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    env:
+      # Names only. Values are not in this repo. Nothing below reads them.
+      FUNX_REGION: ${{ vars.FUNX_REGION }}
+      FUNX_NAMESPACE: ${{ vars.FUNX_NAMESPACE }}
+      FUNX_DEPLOY_ROLE_ARN: ${{ vars.FUNX_DEPLOY_ROLE_ARN }}
+      FUNX_DEVELOP_URL: ${{ vars.FUNX_DEVELOP_URL }}
+      FUNX_COS_BUCKET: ${{ vars.FUNX_COS_BUCKET }}
+      FUNX_COS_REGION: ${{ vars.FUNX_COS_REGION }}
+    steps:
+      - name: Refuse until deploy is wired
+        env:
+          ACTION: ${{ inputs.action }}
+        run: |
+          set -euo pipefail
+          case "$ACTION" in
+            deploy-develop|promote) ;;
+            *) echo "::error::unknown action"; exit 1 ;;
+          esac
+          unset FUNX_REGION FUNX_NAMESPACE FUNX_DEPLOY_ROLE_ARN FUNX_DEVELOP_URL FUNX_COS_BUCKET FUNX_COS_REGION
+          echo "skeleton action=${ACTION}"
+          echo "variable names: FUNX_REGION FUNX_NAMESPACE FUNX_DEPLOY_ROLE_ARN FUNX_DEVELOP_URL FUNX_COS_BUCKET FUNX_COS_REGION"
+          echo "::error::deploy is not wired"
+          exit 1

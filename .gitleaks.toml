@@ -1,0 +1,13 @@
+# gitleaks config. CI fails on any finding.
+title = "funx gitleaks config"
+
+[extend]
+useDefault = true
+
+# Default rules miss fake JWTs. Block any eyJ… three-part string.
+# Tests that need a JWT must sign one at runtime.
+[[rules]]
+id = "jwt-shaped"
+description = "JWT-shaped string (including fake/test tokens)"
+regex = '''\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.'''
+keywords = ["eyj"]
