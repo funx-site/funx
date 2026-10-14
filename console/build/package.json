@@ -1,0 +1,15 @@
+{
+  "name": "funx-console-vendor",
+  "private": true,
+  "description": "Builds ../vendor/codemirror.js once; the console itself has no build step.",
+  "scripts": {
+    "build": "esbuild cm-entry.js --bundle --format=esm --minify --target=es2020 --outfile=../vendor/codemirror.js"
+  },
+  "devDependencies": {
+    "@codemirror/lang-javascript": "^6.2.5",
+    "@codemirror/theme-one-dark": "^6.1.3",
+    "codemirror": "^6.0.2",
+    "esbuild": "^0.25.12",
+    "playwright-core": "^1.64.0"
+  }
+}

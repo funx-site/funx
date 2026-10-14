@@ -1,0 +1,9 @@
+{
+  "Domain": "hello.funx.run",
+  "Protocol": "HTTPS",
+  "CertConfig": { "CertificateId": "<CERT_ID>" },
+  "EndpointsConfig": [
+    { "Namespace": "default", "FunctionName": "funx-router", "Qualifier": "$LATEST", "PathMatch": "/*" }
+  ],
+  "Tags": [{ "Key": "codename", "Value": "funx" }]
+}

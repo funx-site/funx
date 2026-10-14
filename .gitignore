@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.zip
+.env
+.env.*
+*.pem
+*.key
+.acme/
+.dev.vars
+.funx-*
+console/node_modules/
+.env*
+backup-*.zip
+secrets/
+.artifacts/
+!.env.example

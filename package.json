@@ -1,0 +1,25 @@
+{
+  "name": "funx-mvp",
+  "version": "0.1.0",
+  "description": "Funx v1: one command deploys a Node.js function to https://<name>.funx.run",
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "license": "UNLICENSED",
+  "dependencies": {
+    "adm-zip": "^0.5.18",
+    "mysql2": "^3.24.5",
+    "tencentcloud-sdk-nodejs-scf": "^4.1.168",
+    "tencentcloud-sdk-nodejs-tag": "^4.1.244"
+  },
+  "private": true,
+  "bin": {
+    "funx": "cli/funx.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "isolated-vm": "^5.0.4"
+  }
+}

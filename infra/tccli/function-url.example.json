@@ -1,0 +1,9 @@
+{
+  "FunctionName": "funx-u-hello",
+  "Namespace": "default",
+  "TriggerName": "funx_url",
+  "Type": "http",
+  "Qualifier": "$LATEST",
+  "Enable": "OPEN",
+  "TriggerDesc": "{\"AuthType\":\"NONE\",\"NetConfig\":{\"EnableIntranet\":false,\"EnableExtranet\":true}}"
+}
