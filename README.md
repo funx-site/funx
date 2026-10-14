@@ -83,7 +83,10 @@ exports.handler = async (event) => ({
 
 ```
 cli/        funx CLI: dev | deploy | list | delete | disable | enable | secret | var | rotate-key | set-origin
-            | router-deploy | cert-rotate | keygen | jwt-keygen | user-hash | api-build.  ops.js is the shared library.
+            | router-deploy | cert-rotate | keygen | jwt-keygen | user-hash | api-build | runtime-build.
+            ops.js is the shared library. Install: cli/README.md (future npm name @funx-site/cli, not published).
+skills/     agent skills: worker-cli (user workers), platform-ops-cli (platform functions vs CI)
+AGENTS.md   agent guide: CLI first for workers; GitHub CI for platform functions once wired
 router/     funx-router web function (no dependencies)
 shim/       funx_entry.cjs (Workers runtime) + scf_bootstrap, added to every user package
 api/        funx-api web function: app.js (routes), jwt.js (ES256/JWKS), users.js (scrypt, stores), server.js (SCF entry)
@@ -100,6 +103,7 @@ test/       node:test, SCF API faked in memory (no cloud calls)
 ```bash
 npm install
 npm test                      # 86 tests, no network, SCF faked in memory
+node cli/funx.js --help       # or: npm link && funx --help. See cli/README.md
 node cli/funx.js dev examples/worker
 node cli/funx.js api-build    # dist/funx-api.zip (build only)
 ```

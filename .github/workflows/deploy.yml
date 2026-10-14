@@ -16,13 +16,17 @@ on:
         description: promote target version number (unused)
         required: false
 
-# Draft permission list for review. Not applied.
-# Allow, tagged codename=funx only:
-#   scf:UpdateFunctionCode, scf:PublishVersion, scf:UpdateAlias,
-#   read-only List*, upload to the deploy prefix in object storage.
-# Deny:
-#   scf:Invoke, scf:GetFunction, scf:UpdateFunctionConfiguration, scf:UpdateFunction,
-#   scf:Create*, scf:Delete*, triggers, domain changes, tag:*, cam:*, sts:*.
+# 权限草案，尚未应用。正式 CAM 策略卡仍须云架构出具，Chief 批准后才能接线。
+# 1. 拆两个角色：
+#    develop：上传 + GetObject + UpdateFunctionCode，并且只能切换 develop 别名。
+#    production：只能切换 production 别名；无 COS；无 UpdateFunctionCode。
+# 2. UpdateAlias 不共享。别名名称写死在各自角色的策略里。
+# 3. 这是 app 层。保持 UpdateFunctionConfiguration Deny。运行时底座是单独角色 funx-ci-runtime。
+# 4. 资源只限打了标签 codename=funx 的平台函数，绝不包含用户函数。
+#    COS 只允许 scf-deploy/ci/*（或 Funx 等价前缀）。
+# 5. GitHub Environments：develop 与 production。production 必须人工批准。
+#    OIDC 的 sub 绑定到对应的 environment。
+# 6. 独立云账号。绝不复用 demox-ci-*。
 
 permissions:
   contents: read
