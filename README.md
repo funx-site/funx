@@ -16,6 +16,10 @@ funx deploy ./examples/worker --name hello
 # https://hello.funx.run
 ```
 
+The public CLI and agent skill live in sibling repos: [funx-site/cli](https://github.com/funx-site/cli)
+(`@funx-site/cli`, not published yet) and [funx-site/skill](https://github.com/funx-site/skill).
+`skills/worker-cli` in this tree only points there. `cli/` here is the platform operator entry.
+
 Three ways in: CLI (operators, STS credentials), `funx-api` (HTTP API, email accounts, ES256 tokens),
 and the web console (`console/`, static, published at `https://funx.demox.site`).
 
@@ -82,11 +86,10 @@ exports.handler = async (event) => ({
 ## Layout
 
 ```
-cli/        funx CLI: dev | deploy | list | delete | disable | enable | secret | var | rotate-key | set-origin
-            | router-deploy | cert-rotate | keygen | jwt-keygen | user-hash | api-build | runtime-build.
-            ops.js is the shared library. Install: cli/README.md (future npm name @funx-site/cli, not published).
-skills/     agent skills: worker-cli (user workers), platform-ops-cli (platform functions vs CI)
-AGENTS.md   agent guide: CLI first for workers; GitHub CI for platform functions once wired
+cli/        platform operator CLI in this repo (see cli/README.md). Public package is the sibling
+            funx-site/cli (`@funx-site/cli`, not published).
+skills/     worker-cli points at funx-site/skill; platform-ops-cli stays (platform functions vs CI)
+AGENTS.md   agent guide: user deploys via sibling skill + CLI; GitHub CI for platform functions once wired
 router/     funx-router web function (no dependencies)
 shim/       funx_entry.cjs (Workers runtime) + scf_bootstrap, added to every user package
 api/        funx-api web function: app.js (routes), jwt.js (ES256/JWKS), users.js (scrypt, stores), server.js (SCF entry)
