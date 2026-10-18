@@ -24,7 +24,7 @@ description: Operate Funx platform functions with the Funx CLI. Use when choosin
 
 ## 账号和角色
 
-- Funx 使用独立云账号。资源标签是 `codename=funx`。
+- Funx 使用独立云账号。资源标签是 `codename=funx`。还在同一个主账号里时，命名空间、库和 CAM 草案以 [docs/ISOLATION.md](../../docs/ISOLATION.md) 为准。独立主账号仍要 phosa 拍板后才开。
 - 不要借用、假定或引用 `demox-ci-*` 角色，也不要把 Demox 的命名空间、桶或账号当成 Funx 的。
 - 将来的 app 层是两个角色，别名写死在各自策略里：`develop` 才能上传、`GetObject`、`UpdateFunctionCode` 并切换 **develop** 别名；`production` 只能切换 **production** 别名，没有 COS，也没有 `UpdateFunctionCode`。
 - `UpdateFunctionConfiguration` 保持 Deny。运行时底座是另一个角色 `funx-ci-runtime`，不要并进 app 角色。
