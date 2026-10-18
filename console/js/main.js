@@ -1,9 +1,10 @@
 // Funx console: static SPA, hash routes, no build step.
-//   #/                 home
-//   #/new              editor with a runnable sample
-//   #/workers          worker list
-//   #/w/<name>         editor for a deployed worker
-//   #/w/<name>/settings  vars, secrets, disable, delete
+//   #/                          home
+//   #/new                       editor with a runnable sample
+//   #/workers                   worker list
+//   #/workers/<name>            editor for a deployed worker
+//   #/workers/<name>/settings   vars, secrets, disable, delete
+//   #/w/<name>[/settings]       old editor URL; redirects to #/workers/<name>
 //   #/login            email + password
 //   #/setup?t=<token>  one-time password setup link (token removed from the URL at once)
 import { t, getLang, setLang } from './i18n.js';
@@ -12,6 +13,7 @@ import { runInBrowser } from './runner.js';
 import { sample, isSample } from './sample.js';
 import { staticCodeHtml } from './highlight.js';
 import { isMockMode, headerHtml } from './chrome.js';
+import { resolveRoute } from './routes.js';
 
 const cfg = window.FUNX_CONFIG || {};
 const apiBase = isMockMode(cfg) ? '' : cfg.apiBase.trim();
@@ -219,11 +221,11 @@ async function listPage() {
         <div class="row head" role="row"><span>${t('name')}</span><span>${t('url')}</span><span>${t('status')}</span><span title="UTC+8">${t('lastDeploy')}</span><span></span></div>
         ${rows.map((w) => `
         <div class="row" role="row">
-          <a class="name" href="#/w/${esc(w.name)}">${esc(w.name)}</a>
+          <a class="name" href="#/workers/${esc(w.name)}">${esc(w.name)}</a>
           <a class="mono url" href="${esc(w.url)}" target="_blank" rel="noopener">${esc(w.url.replace('https://', ''))}</a>
           <span class="state ${w.disabled ? 'off' : ''}"><i></i>${w.disabled ? t('disabled') : t('running')}</span>
           <span class="mono muted time">${fmtTime(w.last_deploy)}</span>
-          <span class="rowact"><a class="ghost small btnlike" href="#/w/${esc(w.name)}/settings">${t('settings')}</a></span>
+          <span class="rowact"><a class="ghost small btnlike" href="#/workers/${esc(w.name)}/settings">${t('settings')}</a></span>
         </div>`).join('')}
       </div>`;
   app.innerHTML = shell(body);
@@ -257,7 +259,7 @@ async function editorPage(name) {
     </span>` : '');
 
   const crumbs = name
-    ? `<span class="mono wname">${esc(name)}</span><a class="ghost small btnlike" href="#/w/${esc(name)}/settings">${t('settings')}</a>`
+    ? `<span class="mono wname">${esc(name)}</span><a class="ghost small btnlike" href="#/workers/${esc(name)}/settings">${t('settings')}</a>`
     : `<input class="mono wname-in" id="wname" value="${esc(state.name)}" placeholder="${t('namePh')}" aria-label="${t('name')}" spellcheck="false" autocomplete="off">`;
 
   app.innerHTML = `${header({ crumbs, actions: `${urlBlock()}<button class="primary deploy" id="deploy">${t('deploy')}</button>` })}
@@ -414,7 +416,7 @@ async function editorPage(name) {
       btn.insertAdjacentHTML('beforebegin', urlBlock());
       bindCopy();
       toast(t('deployed'), 'ok');
-      if (!name) { localStorage.removeItem(DRAFT_KEY); history.replaceState(null, '', `#/w/${target}`); name = target; }
+      if (!name) { localStorage.removeItem(DRAFT_KEY); history.replaceState(null, '', `#/workers/${target}`); name = target; }
     } catch (e) { toast(errText(e), 'bad'); }
     btn.disabled = false; btn.textContent = t('deploy');
   });
@@ -425,11 +427,11 @@ async function editorPage(name) {
 async function settingsPage(name) {
   if (!api.session.token) { sessionStorage.setItem('funx.next', location.hash); location.hash = '#/login'; return; }
   let w;
-  const crumbs = `<a class="mono wname" href="#/w/${esc(name)}">${esc(name)}</a>`;
+  const crumbs = `<a class="mono wname" href="#/workers/${esc(name)}">${esc(name)}</a>`;
   try { w = await api.get(name); } catch (e) { app.innerHTML = `${header({ crumbs })}<main class="page"><p class="formerr">${icon.warn}<span>${esc(errText(e))}</span></p></main>`; bindHeader(); return; }
 
   const draw = () => {
-    app.innerHTML = `${header({ crumbs, actions: `<a class="primary btnlike" href="#/w/${esc(name)}">${t('editor')}</a>` })}
+    app.innerHTML = `${header({ crumbs, actions: `<a class="primary btnlike" href="#/workers/${esc(name)}">${t('editor')}</a>` })}
     <main class="page narrow">
       <div class="pagehead"><h1>${t('settings')}</h1><a class="mono muted" href="${esc(w.url)}" target="_blank" rel="noopener">${esc(w.url.replace('https://', ''))}</a></div>
 
@@ -474,14 +476,17 @@ async function settingsPage(name) {
 // ---------- router ----------
 
 function render() {
-  const h = location.hash || '#/';
-  const m = h.match(/^#\/w\/([a-z0-9-]+)(\/settings)?$/);
+  const route = resolveRoute(location.hash);
   window.scrollTo(0, 0);
-  if (h.startsWith('#/login')) return loginPage();
-  if (h.startsWith('#/setup')) return setupPage();
-  if (h.startsWith('#/workers')) return listPage();
-  if (h.startsWith('#/new')) return editorPage(null);
-  if (m) return m[2] ? settingsPage(m[1]) : editorPage(m[1]);
+  if (route.page === 'redirect') {
+    history.replaceState(null, '', `${location.pathname}${location.search}${route.to}`);
+    return render();
+  }
+  if (route.page === 'login') return loginPage();
+  if (route.page === 'setup') return setupPage();
+  if (route.page === 'list') return listPage();
+  if (route.page === 'editor') return editorPage(route.name);
+  if (route.page === 'settings') return settingsPage(route.name);
   return homePage();
 }
 
