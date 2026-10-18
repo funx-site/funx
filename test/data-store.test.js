@@ -10,6 +10,7 @@ const { fakeScf, listen } = require('./helpers');
 const {
   LIMITS, DATA_MIGRATIONS, MemoryDataStore, MysqlDataStore, placeNode, chooseNode, cmpPk,
 } = require('../api/data-store');
+const { fakeDataPool } = require('./fake-data-pool');
 
 const NOTES = {
   name: 'notes',
@@ -34,150 +35,13 @@ function ownerFor(nodeId, activeIds) {
   throw new Error(`no owner lands on node ${nodeId}`);
 }
 
-// In-memory stand-in for the statements MysqlDataStore actually sends. Two pools do not share rows.
-function fakeDataPool() {
-  const db = { funx_data_nodes: [], funx_udb: [], funx_utbl: [], funx_udata: [], auto: { funx_udb: 1, funx_utbl: 1 } };
-  let fail = null;
-  const clone = (state) => JSON.parse(JSON.stringify(state));
-  const queryOn = (state, sql, params = []) => {
-    const s = sql.replace(/\s+/g, ' ').trim().replace(/ FOR UPDATE$/, '');
-    if (fail && fail.test(s)) throw Object.assign(new Error('boom'), { code: 'ER_FAKE' });
-    if (s.startsWith('CREATE TABLE IF NOT EXISTS')) return [{}];
-    if (s.startsWith('INSERT IGNORE INTO funx_data_nodes') || s.startsWith('INSERT INTO funx_data_nodes')) {
-      const [id, schema_name, status] = params;
-      if (state.funx_data_nodes.some((r) => r.id === id)) {
-        if (s.startsWith('INSERT IGNORE')) return [{}];
-        throw Object.assign(new Error('dup'), { code: 'ER_DUP_ENTRY' });
-      }
-      state.funx_data_nodes.push({ id, schema_name, status, created_at: new Date() });
-      return [{ affectedRows: 1 }];
-    }
-    if (s.startsWith('UPDATE funx_data_nodes SET status = ? WHERE id = ?')) {
-      const row = state.funx_data_nodes.find((r) => r.id === params[1]);
-      if (row) row.status = params[0];
-      return [{ affectedRows: row ? 1 : 0 }];
-    }
-    if (s === "SELECT id FROM funx_data_nodes WHERE status = 'active' ORDER BY id") {
-      return [state.funx_data_nodes.filter((r) => r.status === 'active').map((r) => ({ id: r.id })).sort((a, b) => a.id - b.id)];
-    }
-    if (s.startsWith('SELECT id FROM funx_udb WHERE owner_id = ? AND name = ?')) {
-      return [state.funx_udb.filter((r) => r.owner_id === params[0] && r.name === params[1]).map((r) => ({ id: r.id }))];
-    }
-    if (s.startsWith('SELECT COUNT(*) AS n FROM funx_udb WHERE owner_id = ?')) {
-      return [[{ n: state.funx_udb.filter((r) => r.owner_id === params[0]).length }]];
-    }
-    if (s.startsWith('SELECT node_id FROM funx_udb WHERE owner_id = ? ORDER BY id LIMIT 1')) {
-      const rows = state.funx_udb.filter((r) => r.owner_id === params[0]).sort((a, b) => a.id - b.id);
-      return [rows[0] ? [{ node_id: rows[0].node_id }] : []];
-    }
-    if (s.startsWith('INSERT INTO funx_udb')) {
-      if (state.funx_udb.some((r) => r.owner_id === params[0] && r.name === params[1])) throw Object.assign(new Error('dup'), { code: 'ER_DUP_ENTRY' });
-      const row = { id: state.auto.funx_udb++, owner_id: params[0], name: params[1], node_id: params[2], ddl_version: 1, created_at: new Date() };
-      state.funx_udb.push(row);
-      return [{ insertId: row.id, affectedRows: 1 }];
-    }
-    if (s.startsWith('SELECT id, owner_id, name, node_id, ddl_version, created_at FROM funx_udb WHERE owner_id = ? AND name = ?')) {
-      return [state.funx_udb.filter((r) => r.owner_id === params[0] && r.name === params[1])];
-    }
-    if (s.startsWith('SELECT id, owner_id, name, node_id, ddl_version, created_at FROM funx_udb WHERE owner_id = ? ORDER BY name')) {
-      return [[...state.funx_udb.filter((r) => r.owner_id === params[0])].sort((a, b) => (a.name < b.name ? -1 : 1))];
-    }
-    if (s.startsWith('DELETE FROM funx_udb WHERE id = ?')) {
-      const before = state.funx_udb.length;
-      state.funx_udb = state.funx_udb.filter((r) => r.id !== params[0]);
-      return [{ affectedRows: before - state.funx_udb.length }];
-    }
-    if (s.startsWith('UPDATE funx_udb SET ddl_version = ddl_version + 1 WHERE id = ?')) {
-      const row = state.funx_udb.find((r) => r.id === params[0]);
-      if (row) row.ddl_version += 1;
-      return [{ affectedRows: row ? 1 : 0 }];
-    }
-    if (s.startsWith('SELECT COUNT(*) AS n FROM funx_utbl WHERE udb_id = ?')) {
-      return [[{ n: state.funx_utbl.filter((r) => r.udb_id === params[0]).length }]];
-    }
-    if (s.startsWith('SELECT id, udb_id, name, columns_json, created_at FROM funx_utbl WHERE udb_id = ? AND name = ?')) {
-      return [state.funx_utbl.filter((r) => r.udb_id === params[0] && r.name === params[1])];
-    }
-    if (s.startsWith('SELECT id, udb_id, name, columns_json, created_at FROM funx_utbl WHERE udb_id = ? ORDER BY name')) {
-      return [[...state.funx_utbl.filter((r) => r.udb_id === params[0])].sort((a, b) => (a.name < b.name ? -1 : 1))];
-    }
-    if (s.startsWith('INSERT INTO funx_utbl')) {
-      if (state.funx_utbl.some((r) => r.udb_id === params[0] && r.name === params[1])) throw Object.assign(new Error('dup'), { code: 'ER_DUP_ENTRY' });
-      const row = { id: state.auto.funx_utbl++, udb_id: params[0], name: params[1], columns_json: JSON.parse(JSON.stringify(params[2])), created_at: new Date() };
-      state.funx_utbl.push(row);
-      return [{ insertId: row.id, affectedRows: 1 }];
-    }
-    if (s.startsWith('DELETE FROM funx_utbl WHERE udb_id = ?')) {
-      const before = state.funx_utbl.length;
-      state.funx_utbl = state.funx_utbl.filter((r) => r.udb_id !== params[0]);
-      return [{ affectedRows: before - state.funx_utbl.length }];
-    }
-    if (s.startsWith('DELETE FROM funx_utbl WHERE id = ?')) {
-      const before = state.funx_utbl.length;
-      state.funx_utbl = state.funx_utbl.filter((r) => r.id !== params[0]);
-      return [{ affectedRows: before - state.funx_utbl.length }];
-    }
-    const lim = s.match(/ LIMIT (\d+)$/);
-    if (s.startsWith('SELECT pk, doc, updated_at FROM funx_udata WHERE udb_id = ? AND utbl_id = ? ORDER BY pk LIMIT')) {
-      const rows = state.funx_udata.filter((r) => r.udb_id === params[0] && r.utbl_id === params[1]).sort((a, b) => cmpPk(a.pk, b.pk));
-      return [rows.slice(0, Number(lim[1]))];
-    }
-    if (s.startsWith('SELECT pk, doc, updated_at FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk > ? ORDER BY pk LIMIT')) {
-      const rows = state.funx_udata.filter((r) => r.udb_id === params[0] && r.utbl_id === params[1] && cmpPk(r.pk, params[2]) > 0).sort((a, b) => cmpPk(a.pk, b.pk));
-      return [rows.slice(0, Number(lim[1]))];
-    }
-    if (s.startsWith('SELECT pk, doc, updated_at FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?')) {
-      return [state.funx_udata.filter((r) => r.udb_id === params[0] && r.utbl_id === params[1] && r.pk === params[2])];
-    }
-    if (s.startsWith('SELECT pk FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?')) {
-      return [state.funx_udata.filter((r) => r.udb_id === params[0] && r.utbl_id === params[1] && r.pk === params[2]).map((r) => ({ pk: r.pk }))];
-    }
-    if (s.startsWith('INSERT INTO funx_udata')) {
-      const hit = state.funx_udata.find((r) => r.udb_id === params[0] && r.utbl_id === params[1] && r.pk === params[2]);
-      if (hit) { hit.doc = JSON.parse(JSON.stringify(params[3])); hit.updated_at = new Date(); return [{ affectedRows: 2 }]; }
-      state.funx_udata.push({ udb_id: params[0], utbl_id: params[1], pk: params[2], doc: JSON.parse(JSON.stringify(params[3])), updated_at: new Date() });
-      return [{ affectedRows: 1 }];
-    }
-    if (s.startsWith('DELETE FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?')) {
-      const before = state.funx_udata.length;
-      state.funx_udata = state.funx_udata.filter((r) => !(r.udb_id === params[0] && r.utbl_id === params[1] && r.pk === params[2]));
-      return [{ affectedRows: before - state.funx_udata.length }];
-    }
-    if (s.startsWith('DELETE FROM funx_udata WHERE udb_id = ? AND utbl_id = ?')) {
-      const before = state.funx_udata.length;
-      state.funx_udata = state.funx_udata.filter((r) => !(r.udb_id === params[0] && r.utbl_id === params[1]));
-      return [{ affectedRows: before - state.funx_udata.length }];
-    }
-    if (s.startsWith('DELETE FROM funx_udata WHERE udb_id = ?')) {
-      const before = state.funx_udata.length;
-      state.funx_udata = state.funx_udata.filter((r) => r.udb_id !== params[0]);
-      return [{ affectedRows: before - state.funx_udata.length }];
-    }
-    throw new Error(`fake data pool: unexpected SQL ${s}`);
-  };
-  const pool = {
-    query: async (sql, p) => queryOn(db, sql, p),
-    getConnection: async () => {
-      let tx = null;
-      return {
-        beginTransaction: async () => { tx = clone(db); },
-        query: async (sql, p) => queryOn(tx, sql, p),
-        commit: async () => { Object.assign(db, tx); tx = null; },
-        rollback: async () => { tx = null; },
-        release() {},
-      };
-    },
-  };
-  return { pool, db, failOn: (re) => { fail = re; } };
-}
-
 async function stores() {
   const mem = new MemoryDataStore();
   const mysql = fakeDataPool();
   return [[mem, null], [new MysqlDataStore(mysql.pool), mysql]];
 }
 
-test('schema: one data table, node_id on the logical database, owner id matches funx_users', () => {
+test('schema: one data table, node_id on the logical database, owner id is VARCHAR(64)', () => {
   const udata = DATA_MIGRATIONS.filter((s) => s.includes('funx_udata'));
   assert.equal(udata.length, 1);
   assert.match(udata[0], /PRIMARY KEY \(udb_id, utbl_id, pk\)/);
@@ -399,6 +263,8 @@ test('http: /v1/databases is owner-scoped; without a store it stays 404', async 
     assert.equal((await call('POST', '/v1/databases', { token: tok('u1'), body: { name: 'other' } })).status, 409);
     assert.equal((await call('GET', '/v1/databases/app', { token: tok('u2') })).status, 404);
     assert.equal((await call('GET', '/v1/databases/app', { token: tok('admin', 'admin') })).status, 404);
+    assert.equal((await call('GET', '/v1/databases', { token: tok('funx') })).status, 404);
+    assert.equal((await call('DELETE', '/v1/databases/platform', { token: tok('funx') })).status, 404);
     assert.deepEqual((await call('GET', '/v1/databases', { token: tok('u2') })).json.databases, []);
     const table = await call('POST', '/v1/databases/app/tables', {
       token: tok('u1'),

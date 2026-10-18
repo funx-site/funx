@@ -3,6 +3,7 @@
 // Accounts see their own rows. A missing name and someone else's name are both 404.
 
 const { dataError } = require('./data-store');
+const { PLATFORM_OWNER } = require('./platform-data');
 
 const STATUS = {
   bad_name: 400,
@@ -21,6 +22,8 @@ function asHttp(HttpError, e) {
 }
 
 async function handleDatabases({ dataStore, user, method, parts, body, query, HttpError }) {
+  // The platform database lives under this owner. It is not an account anyone can open.
+  if (user.id === PLATFORM_OWNER) throw new HttpError(404, 'not_found');
   try {
     return await dispatch({ dataStore, user, method, parts, body, query, HttpError });
   } catch (e) {

@@ -20,7 +20,8 @@ CORS: only `FUNX_CONSOLE_ORIGINS` (default `https://funx.demox.site`, `http://lo
   `FUNX_JWT_KEYS`, keep the old one (private or public part) after it until 12 h have passed.
 - Refresh tokens: not yet. Planned as random strings stored hashed in the user store (needs a DB).
 - User store is pluggable (`api/users.js`): `MemoryUserStore` (tests), `EnvUserStore` (read-only list in
-  `FUNX_USERS`, what can run before a database exists).
+  `FUNX_USERS`, what can run before a database exists). Production stores accounts in the platform logical
+  database ([DATA.md](DATA.md)), in the same `funx_udata` rows as every other database.
 
 ## Workers
 

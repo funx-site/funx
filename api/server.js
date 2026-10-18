@@ -11,7 +11,8 @@
 //   FUNX_JWT_KEYS         JSON array of private P-256 JWKs with kid (`funx jwt-keygen`)
 //   FUNX_DB_HOST FUNX_DB_PORT FUNX_DB_NAME FUNX_DB_USER FUNX_DB_PASSWORD  MySQL (written by 云架构)
 //   FUNX_DB_SSL           "1" for TLS (FUNX_DB_SSL_CA = CA PEM to verify)
-//   Logical databases use that same database as data node 0 (docs/DATA.md). No extra env.
+//   Logical databases use that same database as data node 0 (docs/DATA.md).
+//   Accounts and workers are rows in that store too. No extra env.
 //   FUNX_BOOTSTRAP        JSON {id,email,role,token_sha256,expires_at}: seeds the first account (no password)
 //                         and its one-time setup token on cold start; idempotent, hash only (never the token)
 //   FUNX_WORKER_REGION    region of the user functions, default ap-hongkong
@@ -56,14 +57,14 @@ function fromEnv(env = process.env) {
   // Only platform values are read from env, then removed, like the user shim does.
   delete process.env.FUNX_JWT_KEYS;
   const pool = poolFromEnv(env);
-  const userStore = new MysqlUserStore(pool);
-  // Logical databases share this pool (data node 0). More nodes are extra pools later; see docs/DATA.md.
+  // One store: customer databases and Funx's own accounts and workers are rows in funx_udata.
   const dataStore = new MysqlDataStore(pool, { schemaName: env.FUNX_DB_NAME || 'funx' });
-  // v2 shared runtime: workers in MySQL when a secrets key is configured (no SCF calls per worker).
+  const userStore = new MysqlUserStore(pool, { dataStore });
+  // v2 shared runtime: workers in that store when a secrets key is configured (no SCF calls per worker).
   let workers = null; let runtimeTokenSha256 = null;
   if (env.FUNX_SECRETS_KEY) {
     if (!/^[0-9a-f]{64}$/.test(env.FUNX_RUNTIME_TOKEN_SHA256 || '')) throw new Error('FUNX_RUNTIME_TOKEN_SHA256 (64 hex) is required with FUNX_SECRETS_KEY');
-    workers = new MysqlWorkerStore(pool, { secretsKey: loadSecretsKey(env.FUNX_SECRETS_KEY) });
+    workers = new MysqlWorkerStore(pool, { secretsKey: loadSecretsKey(env.FUNX_SECRETS_KEY), dataStore });
     runtimeTokenSha256 = env.FUNX_RUNTIME_TOKEN_SHA256;
   }
   for (const k of ['FUNX_DB_PASSWORD', 'FUNX_SECRETS_KEY']) delete process.env[k];

@@ -124,6 +124,51 @@ function cmpPk(a, b) {
   return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'));
 }
 
+function pkBuf(v) {
+  return Buffer.isBuffer(v) ? v : Buffer.from(String(v), 'utf8');
+}
+
+// Exclusive upper bound of the keys whose bytes start with `prefix`. Null when every byte is 0xFF.
+function upperBoundBuf(prefix) {
+  const out = Buffer.from(prefix, 'utf8');
+  for (let i = out.length - 1; i >= 0; i--) {
+    if (out[i] !== 0xff) {
+      const u = Buffer.alloc(i + 1);
+      out.copy(u, 0, 0, i);
+      u[i] = out[i] + 1;
+      return u;
+    }
+  }
+  return null;
+}
+
+function rowLimits(base, opts) {
+  if (!opts || opts.maxBytes == null) return base;
+  const n = opts.maxBytes;
+  if (!Number.isInteger(n) || n < 1 || n > 8 * 1024 * 1024) throw dataError('bad_row', 'row limit is invalid');
+  return { ...base, docBytes: n };
+}
+
+function inPrefix(pk, prefix, upper) {
+  if (prefix == null) return true;
+  const buf = Buffer.from(pk, 'utf8');
+  if (Buffer.compare(buf, Buffer.from(prefix, 'utf8')) < 0) return false;
+  if (upper && Buffer.compare(buf, upper) >= 0) return false;
+  return true;
+}
+
+async function listEvery(listPage, opts = {}) {
+  const out = [];
+  let after = null;
+  for (;;) {
+    const page = await listPage({ limit: opts.page, after, prefix: opts.prefix || null });
+    out.push(...page.rows);
+    if (!page.next) return out;
+    if (out.length > 100000) throw dataError('quota', 'too many rows');
+    after = page.next;
+  }
+}
+
 function pkFromUrl(raw, code = 'bad_row') {
   if (typeof raw !== 'string' || raw.length === 0) throw dataError(code, 'primary key must be a non-empty string');
   if ([...raw].length > LIMITS.pkChars) throw dataError(code, 'primary key is too long');
@@ -392,15 +437,26 @@ class MemoryDataStore {
     return hit ? decodeRow(columnsOf(table.columns_json), pk, hit.doc, hit.updated_at) : null;
   }
 
-  async putRow(ownerId, dbName, tableName, pkRaw, values) {
+  async putRow(ownerId, dbName, tableName, pkRaw, values, opts) {
     const { db, table } = this._requireTable(ownerId, dbName, tableName);
     const columns = columnsOf(table.columns_json);
-    const { pk, doc } = encodeRow(columns, pkRaw, values, this.limits);
+    const { pk, doc } = encodeRow(columns, pkRaw, values, rowLimits(this.limits, opts));
     const bucket = this._bucket(db.node_id, db.id, table.id, true);
     const created = !bucket.has(pk);
     const updated_at = new Date();
     bucket.set(pk, { doc, updated_at });
     return { created, row: decodeRow(columns, pk, doc, updated_at) };
+  }
+
+  async insertRow(ownerId, dbName, tableName, pkRaw, values, opts) {
+    const { db, table } = this._requireTable(ownerId, dbName, tableName);
+    const columns = columnsOf(table.columns_json);
+    const { pk, doc } = encodeRow(columns, pkRaw, values, rowLimits(this.limits, opts));
+    const bucket = this._bucket(db.node_id, db.id, table.id, true);
+    if (bucket.has(pk)) throw dataError('exists', 'row already exists');
+    const updated_at = new Date();
+    bucket.set(pk, { doc, updated_at });
+    return decodeRow(columns, pk, doc, updated_at);
   }
 
   async deleteRow(ownerId, dbName, tableName, pkRaw) {
@@ -411,21 +467,75 @@ class MemoryDataStore {
     return true;
   }
 
-  async listRows(ownerId, dbName, tableName, { limit, after } = {}) {
+  async listRows(ownerId, dbName, tableName, { limit, after, prefix } = {}) {
     const { db, table } = this._requireTable(ownerId, dbName, tableName);
     const n = clampLimit(limit, this.limits.list);
     const cursor = after == null ? null : pkFromUrl(after, 'bad_query');
+    const pre = prefix == null ? null : pkFromUrl(prefix, 'bad_query');
+    const upper = pre == null ? null : upperBoundBuf(pre);
     const bucket = this._bucket(db.node_id, db.id, table.id, false);
     const keys = bucket ? [...bucket.keys()] : [];
     keys.sort(cmpPk);
     const picked = [];
     for (const pk of keys) {
+      if (!inPrefix(pk, pre, upper)) {
+        if (upper && Buffer.compare(Buffer.from(pk, 'utf8'), upper) >= 0) break;
+        continue;
+      }
       if (cursor != null && cmpPk(pk, cursor) <= 0) continue;
       const hit = bucket.get(pk);
       picked.push(decodeRow(columnsOf(table.columns_json), pk, hit.doc, hit.updated_at));
       if (picked.length > n) break;
     }
     return pageRows(picked, n);
+  }
+
+  listAll(ownerId, dbName, tableName, opts = {}) {
+    return listEvery((page) => this.listRows(ownerId, dbName, tableName, { ...page, limit: this.limits.list }), opts);
+  }
+
+  _scope(ownerId, dbName) {
+    return {
+      getRow: (table, pk, opts) => this.getRow(ownerId, dbName, table, pk, opts),
+      putRow: (table, pk, values, opts) => this.putRow(ownerId, dbName, table, pk, values, opts),
+      insertRow: (table, pk, values, opts) => this.insertRow(ownerId, dbName, table, pk, values, opts),
+      deleteRow: (table, pk) => this.deleteRow(ownerId, dbName, table, pk),
+      listAll: (table, opts) => this.listAll(ownerId, dbName, table, opts),
+    };
+  }
+
+  _snapshotRows() {
+    const out = new Map();
+    for (const [id, node] of this.nodes) {
+      const rows = new Map();
+      for (const [udb, tables] of node.rows) {
+        const tmap = new Map();
+        for (const [utbl, bucket] of tables) {
+          const copy = new Map();
+          for (const [pk, hit] of bucket) copy.set(pk, { doc: JSON.parse(JSON.stringify(hit.doc)), updated_at: hit.updated_at });
+          tmap.set(utbl, copy);
+        }
+        rows.set(udb, tmap);
+      }
+      out.set(id, rows);
+    }
+    return out;
+  }
+
+  // One writer at a time. Row writes roll back if fn throws, so a token cannot be spent twice
+  // and a half-finished account update does not stick. Catalog changes are not part of this.
+  async transact(ownerId, dbName, fn) {
+    this._requireDb(ownerId, dbName);
+    const prev = this._tail || Promise.resolve();
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    this._tail = prev.then(() => gate, () => gate);
+    await prev;
+    const snap = this._snapshotRows();
+    try { return await fn(this._scope(ownerId, dbName)); } catch (e) {
+      for (const [id, node] of this.nodes) node.rows = snap.get(id) || new Map();
+      throw e;
+    } finally { release(); }
   }
 }
 
@@ -586,43 +696,121 @@ class MysqlDataStore {
     return { deleted: tableName };
   }
 
-  async getRow(ownerId, dbName, tableName, pkRaw) {
-    const { db, table } = await this._requireTable(ownerId, dbName, tableName);
-    const pk = pkFromUrl(pkRaw);
-    const rows = await this.q(this._pool(db.node_id), 'SELECT pk, doc, updated_at FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?', [db.id, table.id, pk]);
-    return rows[0] ? decodeRow(columnsOf(table.columns_json), rows[0].pk, rows[0].doc, rows[0].updated_at) : null;
+  _qdata(db) {
+    const pool = this._pool(db.node_id);
+    return (sql, params) => this.q(pool, sql, params);
   }
 
-  async putRow(ownerId, dbName, tableName, pkRaw, values) {
+  async getRow(ownerId, dbName, tableName, pkRaw, opts) {
     const { db, table } = await this._requireTable(ownerId, dbName, tableName);
-    const columns = columnsOf(table.columns_json);
-    const { pk, doc } = encodeRow(columns, pkRaw, values, this.limits);
-    const pool = this._pool(db.node_id);
-    const existing = await this.q(pool, 'SELECT pk FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?', [db.id, table.id, pk]);
-    await this.q(pool, 'INSERT INTO funx_udata (udb_id, utbl_id, pk, doc) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE doc = VALUES(doc), updated_at = CURRENT_TIMESTAMP(3)', [db.id, table.id, pk, doc]);
-    const row = (await this.q(pool, 'SELECT pk, doc, updated_at FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?', [db.id, table.id, pk]))[0];
-    return { created: existing.length === 0, row: decodeRow(columns, row.pk, row.doc, row.updated_at) };
+    return udataGet(this._qdata(db), db, table, pkRaw, opts);
+  }
+
+  async putRow(ownerId, dbName, tableName, pkRaw, values, opts) {
+    const { db, table } = await this._requireTable(ownerId, dbName, tableName);
+    return udataPut(this._qdata(db), db, table, pkRaw, values, rowLimits(this.limits, opts));
+  }
+
+  async insertRow(ownerId, dbName, tableName, pkRaw, values, opts) {
+    const { db, table } = await this._requireTable(ownerId, dbName, tableName);
+    return udataInsert(this._qdata(db), db, table, pkRaw, values, rowLimits(this.limits, opts));
   }
 
   async deleteRow(ownerId, dbName, tableName, pkRaw) {
     const { db, table } = await this._requireTable(ownerId, dbName, tableName);
-    const pk = pkFromUrl(pkRaw);
-    const r = await this.q(this._pool(db.node_id), 'DELETE FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?', [db.id, table.id, pk]);
-    return !!(r && r.affectedRows);
+    return udataDelete(this._qdata(db), db, table, pkRaw);
   }
 
-  async listRows(ownerId, dbName, tableName, { limit, after } = {}) {
+  async listRows(ownerId, dbName, tableName, opts = {}) {
     const { db, table } = await this._requireTable(ownerId, dbName, tableName);
-    const n = clampLimit(limit, this.limits.list);
-    const cursor = after == null ? null : pkFromUrl(after, 'bad_query');
-    const sql = cursor == null
-      ? `SELECT pk, doc, updated_at FROM funx_udata WHERE udb_id = ? AND utbl_id = ? ORDER BY pk LIMIT ${n + 1}`
-      : `SELECT pk, doc, updated_at FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk > ? ORDER BY pk LIMIT ${n + 1}`;
-    const params = cursor == null ? [db.id, table.id] : [db.id, table.id, cursor];
-    const rows = await this.q(this._pool(db.node_id), sql, params);
-    const columns = columnsOf(table.columns_json);
-    return pageRows(rows.map((r) => decodeRow(columns, r.pk, r.doc, r.updated_at)), n);
+    return udataList(this._qdata(db), db, table, opts, this.limits.list);
   }
+
+  listAll(ownerId, dbName, tableName, opts = {}) {
+    return listEvery((page) => this.listRows(ownerId, dbName, tableName, { ...page, limit: this.limits.list }), opts);
+  }
+
+  // Row writes for one logical database, on that database's node. Catalog reads stay on the catalog pool.
+  async transact(ownerId, dbName, fn) {
+    const db = await this._requireDb(ownerId, dbName);
+    await this.migrate();
+    const pool = this._pool(db.node_id);
+    const c = await pool.getConnection();
+    const q = async (sql, params) => { const [rows] = await c.query(sql, params); return rows; };
+    const tableOf = async (name) => {
+      const table = await this._loadTable(db, name);
+      if (!table) throw dataError('not_found', `no table named ${name}`);
+      return table;
+    };
+    const scope = {
+      getRow: async (name, pk, opts) => udataGet(q, db, await tableOf(name), pk, opts),
+      putRow: async (name, pk, values, opts) => udataPut(q, db, await tableOf(name), pk, values, rowLimits(this.limits, opts)),
+      insertRow: async (name, pk, values, opts) => udataInsert(q, db, await tableOf(name), pk, values, rowLimits(this.limits, opts)),
+      deleteRow: async (name, pk) => udataDelete(q, db, await tableOf(name), pk),
+      listAll: (name, opts = {}) => listEvery(async (page) => udataList(q, db, await tableOf(name), { ...page, limit: this.limits.list }, this.limits.list), opts),
+    };
+    try {
+      await c.beginTransaction();
+      const out = await fn(scope);
+      await c.commit();
+      return out;
+    } catch (e) {
+      await c.rollback().catch(() => {});
+      throw e;
+    } finally { c.release(); }
+  }
+}
+
+async function udataGet(q, db, table, pkRaw, opts) {
+  const pk = pkFromUrl(pkRaw);
+  const lock = opts && opts.lock ? ' FOR UPDATE' : '';
+  const rows = await q(`SELECT pk, doc, updated_at FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?${lock}`, [db.id, table.id, pk]);
+  return rows[0] ? decodeRow(columnsOf(table.columns_json), rows[0].pk, rows[0].doc, rows[0].updated_at) : null;
+}
+
+async function udataPut(q, db, table, pkRaw, values, limits) {
+  const columns = columnsOf(table.columns_json);
+  const { pk, doc } = encodeRow(columns, pkRaw, values, limits);
+  const existing = await q('SELECT pk FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?', [db.id, table.id, pk]);
+  await q('INSERT INTO funx_udata (udb_id, utbl_id, pk, doc) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE doc = VALUES(doc), updated_at = CURRENT_TIMESTAMP(3)', [db.id, table.id, pk, doc]);
+  const row = (await q('SELECT pk, doc, updated_at FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?', [db.id, table.id, pk]))[0];
+  return { created: existing.length === 0, row: decodeRow(columns, row.pk, row.doc, row.updated_at) };
+}
+
+async function udataInsert(q, db, table, pkRaw, values, limits) {
+  const columns = columnsOf(table.columns_json);
+  const { pk, doc } = encodeRow(columns, pkRaw, values, limits);
+  try {
+    await q('INSERT INTO funx_udata (udb_id, utbl_id, pk, doc) VALUES (?, ?, ?, ?)', [db.id, table.id, pk, doc]);
+  } catch (e) {
+    if (e && e.code === 'ER_DUP_ENTRY') throw dataError('exists', 'row already exists');
+    throw e;
+  }
+  return udataGet(q, db, table, pk);
+}
+
+async function udataDelete(q, db, table, pkRaw) {
+  const pk = pkFromUrl(pkRaw);
+  const r = await q('DELETE FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?', [db.id, table.id, pk]);
+  return !!(r && r.affectedRows);
+}
+
+async function udataList(q, db, table, { limit, after, prefix } = {}, max) {
+  const n = clampLimit(limit, max);
+  const cursor = after == null ? null : pkFromUrl(after, 'bad_query');
+  const pre = prefix == null ? null : pkFromUrl(prefix, 'bad_query');
+  const where = ['udb_id = ?', 'utbl_id = ?'];
+  const params = [db.id, table.id];
+  const cursorInPrefix = cursor != null && (pre == null || cmpPk(cursor, pre) >= 0);
+  if (pre != null && !cursorInPrefix) { where.push('pk >= ?'); params.push(pre); }
+  else if (cursor != null) { where.push('pk > ?'); params.push(cursor); }
+  if (pre != null) {
+    const upper = upperBoundBuf(pre);
+    if (upper) { where.push('pk < ?'); params.push(upper); }
+  }
+  const rows = await q(`SELECT pk, doc, updated_at FROM funx_udata WHERE ${where.join(' AND ')} ORDER BY pk LIMIT ${n + 1}`, params);
+  const columns = columnsOf(table.columns_json);
+  return pageRows(rows.map((r) => decodeRow(columns, r.pk, r.doc, r.updated_at)), n);
 }
 
 module.exports = {

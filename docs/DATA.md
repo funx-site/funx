@@ -11,7 +11,7 @@ Catalog and rows for node 0 live in the existing `funx` database, created on fir
 | Table | Role |
 | --- | --- |
 | `funx_data_nodes` | Physical databases. Seeded row: `(0, '<FUNX_DB_NAME>', 'active')`. |
-| `funx_udb` | One logical database. `owner_id` matches `funx_users.id` (`VARCHAR(64)`). `node_id` is where its rows live. `ddl_version` increments when a table is created or dropped. |
+| `funx_udb` | One logical database. `owner_id` is the account id (`VARCHAR(64)`). `node_id` is where its rows live. `ddl_version` increments when a table is created or dropped. |
 | `funx_utbl` | One logical table. `columns_json` is the schema. Names are unique per logical database. |
 | `funx_udata` | **All user rows**, on the node that owns them. Primary key `(udb_id, utbl_id, pk)`. |
 
@@ -47,3 +47,22 @@ Existing logical databases keep their `node_id` and stay on the old pool. New ac
 ## Limits
 
 32 databases per account, 64 tables per database, 32 columns per table, 32 KB per row, 100 rows per list call. A column may only declare `name`, `type` and `primary`. Anything else is rejected, so a property we do not store is not silently ignored.
+
+## Platform database
+
+Funx's own accounts, setup tokens, workers, versions and bindings are rows in this same table. They live in one logical database: owner `funx`, name `platform`. There is no `funx_users` table and no `funx_workers` table.
+
+| Logical table | Primary key | Holds |
+| --- | --- | --- |
+| `users` | account id | email, password hash, role |
+| `user_emails` | normalized email | account id, so login is a point read |
+| `setup_tokens` | token sha256 | expiry and the time it was used |
+| `workers` | worker name | owner, disabled, current version |
+| `worker_versions` | `<name>@<version>` | the bundle |
+| `worker_bindings` | `<name>@<KEY>` | a var, or a sealed secret |
+
+A worker name is `a-z`, `0-9` and `-`, so it never contains `@`. A prefix scan of `<name>@` stays on that worker's range of the clustered index.
+
+`/v1/databases` answers 404 when the caller id is `funx`, so this database is not one an account can open or delete.
+
+Public row writes stay at 32 KB. A worker version is written with a 4 MB ceiling, because source can be 1 MB and JSON quoting needs room. That ceiling is not on the public API.
