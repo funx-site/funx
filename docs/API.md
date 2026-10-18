@@ -50,3 +50,26 @@ Deploy responses carry `domain: "pending"` while funx-api may not create SCF cus
 Errors: `{error, message}`. Cloud permission errors become 502 `platform_permission` (code only logged).
 Writes are serialized inside one instance (router map is read-modify-write); set the function's
 reserved concurrency to 1 until the map moves out of the router env.
+
+## Databases
+
+Not a worker binding, and not a MySQL port. An account creates logical databases; every row of every logical table is stored in one physical table. See [DATA.md](DATA.md) for the node model (how a later physical database is added without moving existing ones).
+
+`:name` and `:table` are 1-64 chars of `a-z`, `0-9` or `_`, starting with a letter. One primary column, type `string`. Other columns: `string`, `int` (safe integer), `bool`, `json`. A write replaces the whole row; omitted columns become null. Rows are capped at 32 KB. List order is the raw bytes of the primary key.
+
+| Method | Path | Body | Notes |
+| --- | --- | --- | --- |
+| GET | `/v1/databases` | | `{databases: [{name, owner, node_id, ddl_version, created_at}]}` for this account |
+| POST | `/v1/databases` | `{name}` | 201; 409 `exists` or `quota` (32 per account) |
+| GET | `/v1/databases/:name` | | 404 `not_found` for a missing name and for another account's name |
+| DELETE | `/v1/databases/:name` | | drops its tables and rows |
+| GET | `/v1/databases/:name/tables` | | `{tables: [{name, columns, created_at}]}` |
+| POST | `/v1/databases/:name/tables` | `{name, columns: [{name, type, primary?}]}` | exactly one `primary: true` column; unknown column properties are rejected |
+| GET | `/v1/databases/:name/tables/:table` | | |
+| DELETE | `/v1/databases/:name/tables/:table` | | |
+| GET | `/v1/databases/:name/tables/:table/rows` | | `?limit=` (1-100, default 50) `&after=<pk>`; `{rows, next}` |
+| PUT | `/v1/databases/:name/tables/:table/rows/:pk` | `{column: value}` | 201 on insert, 200 on replace; `{created, pk, values, updated_at}` |
+| GET | `/v1/databases/:name/tables/:table/rows/:pk` | | |
+| DELETE | `/v1/databases/:name/tables/:table/rows/:pk` | | |
+
+`node_id` is which physical database holds the rows. It is chosen when the account creates its first logical database and reused for the rest. `:pk` is one URL path segment (`encodeURIComponent`).

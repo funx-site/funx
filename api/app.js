@@ -12,6 +12,7 @@ const { buildSourceZip, buildUserZipFromFiles } = require('../cli/package');
 const { validateName, RUNTIME_FUNCTION } = require('../lib/names');
 const { validateBindingName } = require('../lib/bindings');
 const users = require('./users');
+const { handleDatabases } = require('./data-http');
 const { createDbPlatform, createScfPlatform } = require('./platform-db');
 
 const STARTER = fs.readFileSync(path.join(__dirname, '..', 'examples', 'worker', 'index.js'), 'utf8');
@@ -54,7 +55,7 @@ function makeThrottle({ max = 8, windowMs = 10 * 60 * 1000, now = Date.now } = {
 function createApi({
   scf, cfg, signer, userStore, download, fetchImpl = globalThis.fetch,
   origins = DEFAULT_ORIGINS, signupOpen = false, manageDomains = false, log = () => {}, now = Date.now,
-  workers = null, runtimeTokenSha256 = null,
+  workers = null, runtimeTokenSha256 = null, dataStore = null,
 }) {
   // v2 (workers given): code in MySQL, shared funx-runtime, no SCF calls. v1: one SCF function per worker.
   const P = workers ? createDbPlatform({ workers, cfg }) : createScfPlatform({ ops, scf, cfg, download, buildSourceZip, buildUserZipFromFiles });
@@ -227,6 +228,17 @@ function createApi({
 
     const user = await auth(req);
     if (method === 'GET' && p[0] === 'me' && p.length === 1) return [200, { user }];
+    // Logical databases. Absent store keeps the old 404 so a build without the table code stays quiet.
+    if (p[0] === 'databases') {
+      if (!dataStore) throw new HttpError(404, 'not_found');
+      const url = new URL(req.url, 'http://x');
+      const hasBody = method === 'POST' || method === 'PUT';
+      return handleDatabases({
+        dataStore, user, method, parts: p.slice(1), HttpError,
+        body: hasBody ? await readJson(req) : {},
+        query: url.searchParams,
+      });
+    }
     if (p[0] !== 'workers') throw new HttpError(404, 'not_found');
 
     if (p.length === 1) {

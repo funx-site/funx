@@ -68,6 +68,7 @@ imports between the uploaded files (`.js`, `.mjs`; `.json` imported as its defau
 is awaited before the instance answers the next request (bounded by the wall limit);
 `ctx.passThroughOnException()` is a no-op. **Not** available: Node APIs, `require`, `process`, `Buffer`, fs,
 timers beyond the wall limit, streaming bodies (bodies are buffered), WebSocket, Cache API, KV/D1/R2/DO.
+Logical databases ([docs/DATA.md](DATA.md)) are rows in funx-api, not a binding inside the isolate.
 The same worker code runs unchanged on Cloudflare Workers / workerd, so swapping the runtime to workerd later
 changes only `funx-runtime`, not funx-api, the CLI or the console.
 

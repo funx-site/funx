@@ -1,0 +1,49 @@
+# Logical databases
+
+An account can create databases. That does not create a MySQL database, a user, or a machine. Funx keeps a fixed set of physical databases (one today) and stores every user row in a single table.
+
+This is not `env.DB` and not a D1 binding. Worker code cannot open a MySQL connection. The HTTP API below is the whole surface for now. A later gateway can present host, port, user and password in front of the same rows; it does not change this layout.
+
+## Tables
+
+Catalog and rows for node 0 live in the existing `funx` database, created on first use with `CREATE TABLE IF NOT EXISTS`.
+
+| Table | Role |
+| --- | --- |
+| `funx_data_nodes` | Physical databases. Seeded row: `(0, '<FUNX_DB_NAME>', 'active')`. |
+| `funx_udb` | One logical database. `owner_id` matches `funx_users.id` (`VARCHAR(64)`). `node_id` is where its rows live. `ddl_version` increments when a table is created or dropped. |
+| `funx_utbl` | One logical table. `columns_json` is the schema. Names are unique per logical database. |
+| `funx_udata` | **All user rows**, on the node that owns them. Primary key `(udb_id, utbl_id, pk)`. |
+
+`funx_udata.pk` is a non-empty string of at most 255 characters. The primary column's type is `string`, so `ORDER BY pk` and `pk > ?` use that index. Integer, boolean and JSON values live in `doc`.
+
+A point read is:
+
+```sql
+SELECT doc FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?
+```
+
+A list is the same prefix, `ORDER BY pk LIMIT ?`. The client never sends `udb_id`. The API resolves the caller's name to an id, then reads only that id.
+
+## Nodes
+
+`node_id` is written once, on `funx_udb`, and is not updated when another physical database appears.
+
+* An account's later databases copy `node_id` from its earliest one, including when that node is `closed`.
+* An account with no database yet is placed by SHA-256 of `owner_id` onto the nodes whose `status` is `active`.
+* `closed` still serves the databases already placed there. It is left out of placement for new accounts.
+* The process only talks to pools it has mounted. A catalog row with no pool fails the call (`node_unmounted`) instead of writing the catalog and losing the rows.
+
+Node 0 is the pool `funx-api` already uses. `MysqlDataStore` runs `funx_udata`'s DDL on every other mounted pool. Catalog tables stay on the catalog pool, so listing databases does not scan every physical database.
+
+Adding a physical database later, without moving anything already stored:
+
+1. Create one empty schema. This stays a fixed operator step, not something registration does.
+2. Construct `MysqlDataStore` with that pool in `nodes`, for example `nodes: { 1: pool1 }`. Startup creates `funx_udata` there.
+3. Insert `(1, '<schema>', 'active')` into `funx_data_nodes`.
+
+Existing logical databases keep their `node_id` and stay on the old pool. New accounts land on the updated active set. Moving a logical database later means copying its `funx_udata` prefix to the destination pool, then updating `node_id`. That move is not implemented.
+
+## Limits
+
+32 databases per account, 64 tables per database, 32 columns per table, 32 KB per row, 100 rows per list call. A column may only declare `name`, `type` and `primary`. Anything else is rejected, so a property we do not store is not silently ignored.

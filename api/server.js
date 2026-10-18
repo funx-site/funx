@@ -11,6 +11,7 @@
 //   FUNX_JWT_KEYS         JSON array of private P-256 JWKs with kid (`funx jwt-keygen`)
 //   FUNX_DB_HOST FUNX_DB_PORT FUNX_DB_NAME FUNX_DB_USER FUNX_DB_PASSWORD  MySQL (written by 云架构)
 //   FUNX_DB_SSL           "1" for TLS (FUNX_DB_SSL_CA = CA PEM to verify)
+//   Logical databases use that same database as data node 0 (docs/DATA.md). No extra env.
 //   FUNX_BOOTSTRAP        JSON {id,email,role,token_sha256,expires_at}: seeds the first account (no password)
 //                         and its one-time setup token on cold start; idempotent, hash only (never the token)
 //   FUNX_WORKER_REGION    region of the user functions, default ap-hongkong
@@ -27,6 +28,7 @@ const { createApi } = require('./app');
 const { loadKeys, createSigner } = require('./jwt');
 const { MysqlUserStore, poolFromEnv } = require('./store-mysql');
 const { MysqlWorkerStore } = require('./workers-store');
+const { MysqlDataStore } = require('./data-store');
 const { loadSecretsKey } = require('./secretbox');
 
 const COS_HOST = /^https:\/\/[a-z0-9.-]+\.(myqcloud\.com|tencentcos\.cn)\//;
@@ -55,6 +57,8 @@ function fromEnv(env = process.env) {
   delete process.env.FUNX_JWT_KEYS;
   const pool = poolFromEnv(env);
   const userStore = new MysqlUserStore(pool);
+  // Logical databases share this pool (data node 0). More nodes are extra pools later; see docs/DATA.md.
+  const dataStore = new MysqlDataStore(pool, { schemaName: env.FUNX_DB_NAME || 'funx' });
   // v2 shared runtime: workers in MySQL when a secrets key is configured (no SCF calls per worker).
   let workers = null; let runtimeTokenSha256 = null;
   if (env.FUNX_SECRETS_KEY) {
@@ -73,7 +77,7 @@ function fromEnv(env = process.env) {
   // A Proxy so every SCF call uses the credentials present at call time.
   const scf = new Proxy({}, { get: (_, action) => { const c = makeScf(roleCreds(), cfg); return c[action]; } });
   const api = createApi({
-    scf, cfg, signer, userStore, download, origins, workers, runtimeTokenSha256,
+    scf, cfg, signer, userStore, download, origins, workers, runtimeTokenSha256, dataStore,
     signupOpen: env.FUNX_SIGNUP === 'open', manageDomains: env.FUNX_MANAGE_DOMAINS === '1',
     log: (o) => console.log(JSON.stringify(o)),
   });
