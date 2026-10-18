@@ -107,7 +107,7 @@ test('sample-data label only in mock mode; production config (apiBase set) never
   assert.match(main, /isMockMode\(cfg\)/);
   for (const lang of ['zh', 'en']) {
     const t = (k) => dict[lang][k] ?? k;
-    for (const hash of ['#/', '#/workers', '#/w/hello', '#/w/hello/settings', '#/login', '#/setup']) {
+    for (const hash of ['#/', '#/workers', '#/new', '#/workers/hello', '#/workers/hello/settings', '#/w/hello', '#/login', '#/setup']) {
       for (const user of [null, { email: 'a@b.c' }]) {
         for (const minimal of [false, true]) {
           const html = headerHtml({ t, lang, mock: client.mock, user, hash, minimal });
@@ -140,4 +140,35 @@ test('logged-out header (setup / expired link): wordmark + language toggle only'
   assert.match(setup, /autocomplete="username"/);
   assert.equal((setup.match(/autocomplete="new-password"/g) || []).length, 2);
   assert.equal(dict.zh.pwMismatch, '两次输入不一样');
+});
+
+test('home is the worker list; editor lives at #/workers/:name; old list URL redirects', async () => {
+  const { resolveRoute, isListHash } = await import(path.join(ROOT, 'js', 'routes.js'));
+  const { headerHtml } = await import(path.join(ROOT, 'js', 'chrome.js'));
+  const { dict } = await import(path.join(ROOT, 'js', 'i18n.js'));
+  assert.deepEqual(resolveRoute('#/'), { page: 'list' });
+  assert.deepEqual(resolveRoute(''), { page: 'list' });
+  assert.deepEqual(resolveRoute('#/workers'), { page: 'redirect', to: '#/' });
+  assert.deepEqual(resolveRoute('#/workers/'), { page: 'redirect', to: '#/' });
+  assert.deepEqual(resolveRoute('#/new'), { page: 'editor', name: null });
+  assert.deepEqual(resolveRoute('#/workers/hello'), { page: 'editor', name: 'hello' });
+  assert.deepEqual(resolveRoute('#/workers/time-api/settings'), { page: 'settings', name: 'time-api' });
+  assert.deepEqual(resolveRoute('#/w/hello'), { page: 'redirect', to: '#/workers/hello' });
+  assert.deepEqual(resolveRoute('#/w/hello/settings'), { page: 'redirect', to: '#/workers/hello/settings' });
+  assert.deepEqual(resolveRoute('#/login'), { page: 'login' });
+  assert.deepEqual(resolveRoute('#/setup?t=abc'), { page: 'setup' });
+  assert.equal(dict.zh.emptyCta, '新建 Worker');
+  assert.equal(dict.en.emptyCta, 'New Worker');
+  const t = (k) => dict.zh[k];
+  const nav = (html) => html.match(/<nav class="nav">([\s\S]*?)<\/nav>/)[1];
+  const home = headerHtml({ t, lang: 'zh', mock: false, user: { email: 'a@b.c' }, hash: '#/' });
+  assert.match(nav(home), /href="#\/" class="on"/);
+  const editor = headerHtml({ t, lang: 'zh', mock: false, user: { email: 'a@b.c' }, hash: '#/workers/hello' });
+  assert.match(nav(editor), /href="#\/">/);
+  assert.equal(isListHash('#/workers/hello'), false);
+  assert.equal(isListHash('#/new'), false);
+  const main = fs.readFileSync(path.join(ROOT, 'js', 'main.js'), 'utf8');
+  assert.match(main, /href="#\/new"/);
+  assert.match(main, /href="#\/workers\/\$\{esc\(w\.name\)\}"/);
+  assert.ok(!/href="#\/w\//.test(main), 'editor links use #/workers/:name');
 });

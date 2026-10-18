@@ -39,7 +39,7 @@ for (const [label, viewport, mobile] of [['desktop', { width: 1440, height: 900 
   await shot('21-setup-error');
   await page.fill('input[name=password]', 'a good long passphrase'); await page.fill('input[name=password2]', 'a good long passphrase');
   await page.click('button[type=submit]');
-  await page.waitForFunction(() => location.hash.startsWith('#/workers'));
+  await page.waitForFunction(() => location.hash === '#/');
   // reuse -> expired page
   await page.evaluate(() => localStorage.removeItem('funx.token'));
   await page.goto(base + 'index.html#/setup?t=demo-setup-token-0123456789');
@@ -48,7 +48,7 @@ for (const [label, viewport, mobile] of [['desktop', { width: 1440, height: 900 
   // settings rows: 删除 for var and secret
   await page.evaluate(() => localStorage.setItem('funx.token', 'mock.x.local'));
   await page.evaluate((seed) => localStorage.setItem('funx.mock', JSON.stringify(seed)), SEED);
-  await page.goto(base + 'index.html#/w/hello/settings');
+  await page.goto(base + 'index.html#/workers/hello/settings');
   await page.reload();
   await page.waitForSelector('[data-delsecret]');
   const bg = await page.evaluate(() => [...document.querySelectorAll('[data-delvar],[data-delsecret]')].map((b) => getComputedStyle(b).backgroundColor));
