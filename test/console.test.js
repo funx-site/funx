@@ -121,6 +121,21 @@ test('sample-data label only in mock mode; production config (apiBase set) never
   }
 });
 
+test('home is #/ and a new worker opens at #/new', () => {
+  const main = fs.readFileSync(path.join(ROOT, 'js', 'main.js'), 'utf8');
+  const i18n = fs.readFileSync(path.join(ROOT, 'js', 'i18n.js'), 'utf8');
+  assert.match(main, /function homePage/);
+  const list = main.slice(main.indexOf('async function listPage'), main.indexOf('const DRAFT_KEY'));
+  assert.ok(!/href="#\/"/.test(list), 'the worker list does not link new workers back to the home page');
+  assert.match(list, /href="#\/new"/);
+  const router = main.slice(main.indexOf('function render'));
+  assert.match(router, /#\/new'\)\) return editorPage\(null\)/);
+  assert.match(router, /return homePage\(\)/);
+  for (const k of ['homeTitle1', 'homeTitle2', 'homeLede', 'homeTry', 'homeWrite', 'step1t', 'homeCli']) {
+    assert.equal((i18n.match(new RegExp(`${k}:`, 'g')) || []).length, 2, k);
+  }
+});
+
 test('logged-out header (setup / expired link): wordmark + language toggle only', async () => {
   const { headerHtml } = await import(path.join(ROOT, 'js', 'chrome.js'));
   const { dict } = await import(path.join(ROOT, 'js', 'i18n.js'));
@@ -135,7 +150,7 @@ test('logged-out header (setup / expired link): wordmark + language toggle only'
     }
   }
   const main = fs.readFileSync(path.join(ROOT, 'js', 'main.js'), 'utf8');
-  const setup = main.slice(main.indexOf('function expiredPage'), main.indexOf('// ---------- list'));
+  const setup = main.slice(main.indexOf('function expiredPage'), main.indexOf('// ---------- home'));
   assert.ok(!/header\(\)/.test(setup), 'setup/expired pages use the minimal header');
   assert.match(setup, /autocomplete="username"/);
   assert.equal((setup.match(/autocomplete="new-password"/g) || []).length, 2);
