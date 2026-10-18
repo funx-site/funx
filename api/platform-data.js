@@ -53,6 +53,13 @@ const PLATFORM_TABLES = {
     { name: 'value', type: 'string' },
     { name: 'sealed', type: 'string' },
   ],
+  // MySQL gateway logins. The password itself is not stored, only the native hash.
+  mysql_accounts: [
+    { name: 'username', type: 'string', primary: true },
+    { name: 'owner_id', type: 'string' },
+    { name: 'auth_string', type: 'string' },
+    { name: 'created_at', type: 'string' },
+  ],
 };
 
 const exists = (message) => Object.assign(new Error(message), { code: 'exists' });

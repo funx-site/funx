@@ -54,7 +54,30 @@ reserved concurrency to 1 until the map moves out of the router env.
 
 ## Databases
 
-Not a worker binding, and not a MySQL port. An account creates logical databases; every row of every logical table is stored in one physical table. See [DATA.md](DATA.md) for the node model (how a later physical database is added without moving existing ones).
+Not a worker binding. An account's rows live in one physical table, shared by every account, and the account reaches them over MySQL or over HTTP. See [DATA.md](DATA.md) for the node model (how a later physical database is added without moving existing ones).
+
+### MySQL
+
+`FUNX_MYSQL_PORT` starts a MySQL listener on the API process. `FUNX_MYSQL_HOST` is the host in the connection string. The password is shown only when it is rotated.
+
+| Method | Path | Body | Notes |
+| --- | --- | --- | --- |
+| GET | `/v1/mysql` | | `{host, port, user, password_set, databases, uri}` — `uri` has no password |
+| POST | `/v1/mysql` | `{}` | rotates the password; `{host, port, user, password, password_set, databases, uri}` |
+
+404 when the listener is not configured, or when the caller is the platform owner. The MySQL user is the account id when that id is 1–32 characters of letters, digits and `_`. Otherwise it is `f` plus 31 hex characters of the id's SHA-256.
+
+A client uses the normal text protocol and `mysql_native_password` (the `mysql` CLI, a GUI, or an application connection string). Example, after `POST /v1/mysql`:
+
+```
+mysql -h <host> -P <port> -u <user> -p
+```
+
+What works: `CREATE`/`DROP DATABASE`, `CREATE`/`DROP TABLE`, `INSERT`, `REPLACE`, `UPDATE`, `DELETE`, `SELECT`, `USE`, `BEGIN`/`COMMIT`/`ROLLBACK`, `SHOW DATABASES`/`TABLES`/`COLUMNS`/`CREATE TABLE`/`VARIABLES`/`TABLE STATUS`, `DESCRIBE`, and `information_schema` for schemata, tables and columns. `WHERE` is `AND` of comparisons and `IS NULL`. `ORDER BY` and `LIMIT` work. `SET NAMES` and `SET autocommit` are accepted.
+
+What answers with an error: `JOIN`, `OR`, `GROUP BY`, a second index, a primary key that is not a string, fractional numbers, prepared statements (`COM_STMT_PREPARE`), and TLS. Column types are `VARCHAR` (string), `INT` (safe integer), `BOOL`, and `JSON`. A table has exactly one primary key, and it is a string, so the row order is that key's bytes. A row is at most 32 KB. Autocommit is on until the session turns it off; `BEGIN` keeps the change in the session until `COMMIT` or `ROLLBACK`.
+
+### HTTP
 
 `:name` and `:table` are 1-64 chars of `a-z`, `0-9` or `_`, starting with a letter. One primary column, type `string`. Other columns: `string`, `int` (safe integer), `bool`, `json`. A write replaces the whole row; omitted columns become null. Rows are capped at 32 KB. List order is the raw bytes of the primary key.
 

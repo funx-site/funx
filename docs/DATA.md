@@ -2,7 +2,9 @@
 
 An account can create databases. That does not create a MySQL database, a user, or a machine. Funx keeps a fixed set of physical databases (one today) and stores every user row in a single table.
 
-This is not `env.DB` and not a D1 binding. Worker code cannot open a MySQL connection. The HTTP API below is the whole surface for now. A later gateway can present host, port, user and password in front of the same rows; it does not change this layout.
+This is not `env.DB` and not a D1 binding. Worker code does not receive a database handle. An account connects the way it would connect to any other cloud MySQL: host, port, user, password, and SQL. Those statements read and write the same `funx_udata` rows as the HTTP API. Creating a database is still one catalog row. It does not create a physical database.
+
+The MySQL listener is a TCP port on the API process (`FUNX_MYSQL_PORT`, bound on `0.0.0.0`). The host printed in connection strings is `FUNX_MYSQL_HOST` (default `127.0.0.1`). SCF Web functions only accept HTTP on `:9000`, so that HTTP port is not the MySQL port. Turn the listener on where the process can accept TCP. The wire protocol is the text protocol with `mysql_native_password`. See [API.md](API.md) for the SQL that works and the parts that answer with an error.
 
 ## Tables
 
@@ -60,6 +62,9 @@ Funx's own accounts, setup tokens, workers, versions and bindings are rows in th
 | `workers` | worker name | owner, disabled, current version |
 | `worker_versions` | `<name>@<version>` | the bundle |
 | `worker_bindings` | `<name>@<KEY>` | a var, or a sealed secret |
+| `mysql_accounts` | MySQL user name | the account id and the `mysql_native_password` hash |
+
+`GET /v1/mysql` returns the host, port, user and database names. `POST /v1/mysql` rotates the password and returns it once. The platform owner `funx` has no MySQL login.
 
 A worker name is `a-z`, `0-9` and `-`, so it never contains `@`. A prefix scan of `<name>@` stays on that worker's range of the clustered index.
 

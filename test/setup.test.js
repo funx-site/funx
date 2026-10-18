@@ -125,7 +125,7 @@ test('server: worker region is ap-hongkong even when the runtime region is ap-gu
 test('mysql store: health counts the platform logical tables; pool max defaults to 2', async () => {
   const { pool, failOn } = fakeDataPool();
   const store = new MysqlUserStore(pool);
-  assert.deepEqual(await store.health(), { db: 'ok', tables: 6 });
+  assert.deepEqual(await store.health(), { db: 'ok', tables: 7 });
   failOn(/FROM funx_utbl/);
   await assert.rejects(store.health(), /boom/);
   const { poolFromEnv } = require('../api/store-mysql');

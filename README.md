@@ -60,7 +60,7 @@ Same contract as Cloudflare Workers:
 | `ctx.passThroughOnException()` | no-op (no origin behind a worker); exceptions → 500 |
 | `wrangler.toml` `main = "src/index.js"` | honoured for the entry |
 | `.dev.vars` | `funx dev` reads it; never packaged |
-| KV, D1, R2, Durable Objects, Cron, `request.cf` | not yet. A logical database is a separate account resource ([docs/DATA.md](docs/DATA.md)), not an `env` binding |
+| KV, D1, R2, Durable Objects, Cron, `request.cf` | not yet. A logical database is a separate account resource ([docs/DATA.md](docs/DATA.md)): host, port, user, password, and SQL. It is not an `env` binding |
 | global edge, ~ms cold start | **no**: one region (Hong Kong), SCF container cold start ~0.3-2 s |
 
 Several `Set-Cookie` headers, binary request/response bodies and any status code pass through.
@@ -92,11 +92,11 @@ skills/     worker-cli points at funx-site/skill; platform-ops-cli stays (platfo
 AGENTS.md   agent guide: user deploys via sibling skill + CLI; GitHub CI for platform functions once wired
 router/     funx-router web function (no dependencies)
 shim/       funx_entry.cjs (Workers runtime) + scf_bootstrap, added to every user package
-api/        funx-api web function: app.js (routes), jwt.js (ES256/JWKS), users.js (scrypt, stores), data-store.js (logical databases), platform-data.js (accounts and workers as rows), server.js (SCF entry)
+api/        funx-api web function: app.js (routes), jwt.js (ES256/JWKS), users.js (scrypt, stores), data-store.js (logical databases), platform-data.js (accounts and workers as rows), mysql-gateway.js (MySQL text protocol), server.js (SCF entry)
 console/    web console, plain static files (index.html, app.css, js/, vendor/codemirror.js)
 lib/        name rules, header hygiene, router map format, vars/secrets bindings (shared)
 docs/API.md funx-api reference
-docs/DATA.md logical databases: one shared table, node_id for more physical databases later
+docs/DATA.md logical databases: one shared table, MySQL host/port in front of it, node_id for more physical databases later
 examples/hello/ (v1 handler), examples/worker/ (Workers style)
 infra/      FRONTING.md (why SCF custom domains), tccli/ examples, deploy-router.sh
 test/       node:test, SCF API faked in memory (no cloud calls)

@@ -14,6 +14,8 @@ const { validateBindingName } = require('../lib/bindings');
 const users = require('./users');
 const { handleDatabases } = require('./data-http');
 const { createDbPlatform, createScfPlatform } = require('./platform-db');
+const { PLATFORM_OWNER } = require('./platform-data');
+const { mysqlAccountView, rotateMysqlPassword, withEndpoint } = require('./mysql-auth');
 
 const STARTER = fs.readFileSync(path.join(__dirname, '..', 'examples', 'worker', 'index.js'), 'utf8');
 const MAX_JSON = 7 * 1024 * 1024; // base64 zip of up to ~5 MB
@@ -55,7 +57,7 @@ function makeThrottle({ max = 8, windowMs = 10 * 60 * 1000, now = Date.now } = {
 function createApi({
   scf, cfg, signer, userStore, download, fetchImpl = globalThis.fetch,
   origins = DEFAULT_ORIGINS, signupOpen = false, manageDomains = false, log = () => {}, now = Date.now,
-  workers = null, runtimeTokenSha256 = null, dataStore = null,
+  workers = null, runtimeTokenSha256 = null, dataStore = null, mysql = null,
 }) {
   // v2 (workers given): code in MySQL, shared funx-runtime, no SCF calls. v1: one SCF function per worker.
   const P = workers ? createDbPlatform({ workers, cfg }) : createScfPlatform({ ops, scf, cfg, download, buildSourceZip, buildUserZipFromFiles });
@@ -228,6 +230,16 @@ function createApi({
 
     const user = await auth(req);
     if (method === 'GET' && p[0] === 'me' && p.length === 1) return [200, { user }];
+    // MySQL login for this account. The password is returned only by POST, which rotates it.
+    if (p[0] === 'mysql' && p.length === 1) {
+      if (!dataStore || !mysql || user.id === PLATFORM_OWNER) throw new HttpError(404, 'not_found');
+      if (method === 'GET') return [200, await mysqlAccountView(dataStore, user.id, mysql)];
+      if (method === 'POST') {
+        await readJson(req);
+        return [200, withEndpoint(await rotateMysqlPassword(dataStore, user.id), mysql)];
+      }
+      throw new HttpError(405, 'method_not_allowed');
+    }
     // Logical databases. Absent store keeps the old 404 so a build without the table code stays quiet.
     if (p[0] === 'databases') {
       if (!dataStore) throw new HttpError(404, 'not_found');
