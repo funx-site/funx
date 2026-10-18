@@ -168,7 +168,8 @@ label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; }
 .heroacts { display: flex; justify-content: center; gap: 10px; margin-top: 22px; }
 .heroacts .btnlike { height: 42px; padding: 0 18px; }
 .stage { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(200px, .75fr); margin-top: 36px; border: 1px solid var(--line); border-radius: 18px; overflow: hidden; background: var(--surface-strong); }
-.stage-code { position: relative; min-height: 196px; background: linear-gradient(180deg, var(--code-bg-2), var(--code-bg)); }
+.stage-code { background: linear-gradient(180deg, var(--code-bg-2), var(--code-bg)); }
+.stage-code .code-static { position: relative; inset: auto; height: auto; }
 .stage-out { display: flex; flex-direction: column; justify-content: center; gap: 12px; padding: 22px 20px; border-left: 1px solid var(--line); }
 .stage-out .host { margin: 0; font-weight: 650; }
 .stage-out pre { margin: 0; padding: 12px 14px; border-radius: 12px; background: var(--bg-2); font: 13px/1.5 var(--mono); white-space: pre-wrap; }

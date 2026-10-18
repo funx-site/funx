@@ -174,7 +174,7 @@ async function setupPage() {
 
 function homePage() {
   const loggedIn = Boolean(api.session.user);
-  const snippet = 'export default {\n  async fetch() {\n    return new Response("hello from funx\\n");\n  },\n};\n';
+  const snippet = 'export default {\n  async fetch() {\n    return new Response("hello from funx\\n");\n  },\n};';
   const write = `<a class="primary btnlike" href="#/new">${loggedIn ? t('homeWrite') : t('homeTry')}</a>`;
   const next = loggedIn
     ? `<a class="outline btnlike" href="#/workers">${t('homeOpen')}</a>`
@@ -187,7 +187,7 @@ function homePage() {
       <div class="heroacts">${write}${next}</div>
     </section>
     <section class="stage" aria-label="${esc(t('homePreview'))}">
-      <div class="stage-code"><div class="code-static">${staticCodeHtml(snippet)}</div></div>
+      <div class="stage-code"><div class="code-static wrap">${staticCodeHtml(snippet)}</div></div>
       <div class="stage-out">
         <p class="mono host">hello.${esc(baseDomain)}</p>
         <pre>hello from funx</pre>
