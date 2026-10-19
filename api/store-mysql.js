@@ -1,5 +1,6 @@
 'use strict';
-// MySQL user store for funx-api (database `funx` on the Demox MySQL instance, own user).
+// MySQL user store for funx-api. Database name is `funx` and the account is a funx user
+// (see lib/isolation.js). Grants stay on that database only.
 // Env (written by 云架构 into funx-api, never into git):
 //   FUNX_DB_HOST FUNX_DB_PORT FUNX_DB_NAME FUNX_DB_USER FUNX_DB_PASSWORD
 //   optional FUNX_DB_SSL=1 (TLS; FUNX_DB_SSL_CA = PEM of the TencentDB CA to verify the server)
@@ -7,6 +8,7 @@
 // cold start with CREATE TABLE IF NOT EXISTS (idempotent), so no separate migration run is needed.
 
 const { normalizeEmail, newUserId } = require('./users');
+const { assertDatabase } = require('../lib/isolation');
 
 const MIGRATIONS = [
   `CREATE TABLE IF NOT EXISTS funx_users (
@@ -98,6 +100,7 @@ function poolFromEnv(env = process.env) {
   const need = ['FUNX_DB_HOST', 'FUNX_DB_NAME', 'FUNX_DB_USER', 'FUNX_DB_PASSWORD'];
   const missing = need.filter((k) => !env[k]);
   if (missing.length) throw new Error(`database not configured: missing ${missing.join(', ')}`);
+  assertDatabase({ name: env.FUNX_DB_NAME, user: env.FUNX_DB_USER });
   const mysql = require('mysql2/promise');
   const ssl = env.FUNX_DB_SSL === '1' ? (env.FUNX_DB_SSL_CA ? { ca: env.FUNX_DB_SSL_CA, rejectUnauthorized: true } : { rejectUnauthorized: false }) : undefined;
   return mysql.createPool({

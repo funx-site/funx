@@ -96,6 +96,7 @@ api/        funx-api web function: app.js (routes), jwt.js (ES256/JWKS), users.j
 console/    web console, plain static files (index.html, app.css, js/, vendor/codemirror.js)
 lib/        name rules, header hygiene, router map format, vars/secrets bindings (shared)
 docs/API.md funx-api reference
+docs/ISOLATION.md  same-account fence: namespace `funx`, database `funx`, CAM draft (not wired)
 examples/hello/ (v1 handler), examples/worker/ (Workers style)
 infra/      FRONTING.md (why SCF custom domains), tccli/ examples, deploy-router.sh
 test/       node:test, SCF API faked in memory (no cloud calls)
