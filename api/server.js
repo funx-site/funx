@@ -11,6 +11,11 @@
 //   FUNX_JWT_KEYS         JSON array of private P-256 JWKs with kid (`funx jwt-keygen`)
 //   FUNX_DB_HOST FUNX_DB_PORT FUNX_DB_NAME FUNX_DB_USER FUNX_DB_PASSWORD  MySQL (written by 云架构)
 //   FUNX_DB_SSL           "1" for TLS (FUNX_DB_SSL_CA = CA PEM to verify)
+//   Logical databases use that same database as data node 0 (docs/DATA.md).
+//   Accounts and workers are rows in that store too. No extra env.
+//   FUNX_MYSQL_HOST       public host printed in mysql:// URIs (default 127.0.0.1)
+//   FUNX_MYSQL_PORT       if set, listen for MySQL clients on this TCP port (bind 0.0.0.0).
+//                         SCF's HTTP port :9000 is not this port; the process has to accept TCP.
 //   FUNX_BOOTSTRAP        JSON {id,email,role,token_sha256,expires_at}: seeds the first account (no password)
 //                         and its one-time setup token on cold start; idempotent, hash only (never the token)
 //   FUNX_WORKER_REGION    region of the user functions, default ap-hongkong
@@ -27,7 +32,9 @@ const { createApi } = require('./app');
 const { loadKeys, createSigner } = require('./jwt');
 const { MysqlUserStore, poolFromEnv } = require('./store-mysql');
 const { MysqlWorkerStore } = require('./workers-store');
+const { MysqlDataStore } = require('./data-store');
 const { loadSecretsKey } = require('./secretbox');
+const { startMysqlGateway } = require('./mysql-gateway');
 
 const COS_HOST = /^https:\/\/[a-z0-9.-]+\.(myqcloud\.com|tencentcos\.cn)\//;
 
@@ -54,12 +61,14 @@ function fromEnv(env = process.env) {
   // Only platform values are read from env, then removed, like the user shim does.
   delete process.env.FUNX_JWT_KEYS;
   const pool = poolFromEnv(env);
-  const userStore = new MysqlUserStore(pool);
-  // v2 shared runtime: workers in MySQL when a secrets key is configured (no SCF calls per worker).
+  // One store: customer databases and Funx's own accounts and workers are rows in funx_udata.
+  const dataStore = new MysqlDataStore(pool, { schemaName: env.FUNX_DB_NAME || 'funx' });
+  const userStore = new MysqlUserStore(pool, { dataStore });
+  // v2 shared runtime: workers in that store when a secrets key is configured (no SCF calls per worker).
   let workers = null; let runtimeTokenSha256 = null;
   if (env.FUNX_SECRETS_KEY) {
     if (!/^[0-9a-f]{64}$/.test(env.FUNX_RUNTIME_TOKEN_SHA256 || '')) throw new Error('FUNX_RUNTIME_TOKEN_SHA256 (64 hex) is required with FUNX_SECRETS_KEY');
-    workers = new MysqlWorkerStore(pool, { secretsKey: loadSecretsKey(env.FUNX_SECRETS_KEY) });
+    workers = new MysqlWorkerStore(pool, { secretsKey: loadSecretsKey(env.FUNX_SECRETS_KEY), dataStore });
     runtimeTokenSha256 = env.FUNX_RUNTIME_TOKEN_SHA256;
   }
   for (const k of ['FUNX_DB_PASSWORD', 'FUNX_SECRETS_KEY']) delete process.env[k];
@@ -70,10 +79,19 @@ function fromEnv(env = process.env) {
       .catch((e) => { console.log(JSON.stringify({ err: 'bootstrap', code: e && e.code })); boot = null; });
   }
   const origins = (env.FUNX_CONSOLE_ORIGINS || 'https://funx.demox.site,http://localhost').split(',').map((s) => s.trim()).filter(Boolean);
+  // The MySQL listener shares this store. It is off unless a TCP port is configured.
+  let mysql = null;
+  const mysqlPort = Number(env.FUNX_MYSQL_PORT);
+  if (mysqlPort) {
+    const host = env.FUNX_MYSQL_HOST || '127.0.0.1';
+    startMysqlGateway({ dataStore, port: mysqlPort, bindHost: '0.0.0.0' })
+      .catch((e) => console.log(JSON.stringify({ err: 'mysql_gateway', code: e && e.code })));
+    mysql = { host, port: mysqlPort };
+  }
   // A Proxy so every SCF call uses the credentials present at call time.
   const scf = new Proxy({}, { get: (_, action) => { const c = makeScf(roleCreds(), cfg); return c[action]; } });
   const api = createApi({
-    scf, cfg, signer, userStore, download, origins, workers, runtimeTokenSha256,
+    scf, cfg, signer, userStore, download, origins, workers, runtimeTokenSha256, dataStore, mysql,
     signupOpen: env.FUNX_SIGNUP === 'open', manageDomains: env.FUNX_MANAGE_DOMAINS === '1',
     log: (o) => console.log(JSON.stringify(o)),
   });

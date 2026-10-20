@@ -36,7 +36,7 @@ GitHub `production` 环境仍要人工批准，OIDC 的 `sub` 绑到对应 envir
 2. `funx-u-hello` 是用户函数。`funx-api` / `funx-router` / `funx-runtime` 是平台函数。`demox-api`、`funx-u-` 两边都不是。
 3. 资源名带 `namespace/funx/function/funx-u-hello`。`default` 或 `demox-api` 组不出资源名。
 4. 库名 `funx`、账号 `funx` 或 `funx_api` 通过。`demox`、`root`、`u` 在打开连接之前就被拒绝。
-5. `api/store-mysql.js` 和 `api/workers-store.js` 的 SQL 只出现 `funx_` 表（健康检查可读 `information_schema`）。出现 `demox_users` 或裸表 `users` 会失败。
+5. `api/store-mysql.js`、`api/workers-store.js` 和 `api/data-store.js` 的 SQL 只出现 `funx_` 表（健康检查可读 `information_schema`）。出现 `demox_users` 或裸表 `users` 会失败。
 6. develop 能改平台函数代码、切 `develop` 别名、写 `scf-deploy/ci/`。它不能改 `funx-u-hello`、不能用命名空间 `default`、不能切 `production`、不能改函数配置。
 7. production 只能切 `production` 别名。它不能改代码，也不能读 COS。runtime 角色在本草案里没有任何允许项。
 8. 把用户函数写进 develop 的允许列表，或给 production 加 COS，草案审查会失败。

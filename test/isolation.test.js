@@ -51,7 +51,7 @@ test('database is funx and the account is a funx user', () => {
 });
 
 test('user and worker SQL names only funx_ tables', () => {
-  const files = ['api/store-mysql.js', 'api/workers-store.js'].map((f) => fs.readFileSync(path.join(__dirname, '..', f), 'utf8'));
+  const files = ['api/store-mysql.js', 'api/workers-store.js', 'api/data-store.js'].map((f) => fs.readFileSync(path.join(__dirname, '..', f), 'utf8'));
   assert.deepEqual(referencedTables('ON DUPLICATE KEY UPDATE kind = VALUES(kind)'), []);
   for (const src of files) assertFunxSql(src);
   for (const sql of MIGRATIONS) assertFunxSql(sql);

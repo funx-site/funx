@@ -214,8 +214,9 @@ test('runtime endpoint: runtime token only; user JWTs (even admin) and bad token
     // the runtime token is not a user token
     assert.equal((await st.call('GET', '/v1/workers', { token: st.runtimeToken })).status, 401);
     // secrets are stored sealed and never returned to users
-    const row = [...st.workers.b.get('hello').values()][0];
-    assert.ok(row.sealed && !row.sealed.includes('s3cret') && row.value === undefined);
+    const rows = await st.workers.data.listAll('funx', 'platform', 'worker_bindings', { prefix: 'hello@' });
+    const row = rows.find((r) => r.values.bkey === 'TOKEN');
+    assert.ok(row.values.sealed && !row.values.sealed.includes('s3cret') && row.values.value === null);
     const w = await st.call('GET', '/v1/workers/hello', { token: admin });
     assert.deepEqual(w.json.secrets, ['TOKEN']); assert.ok(!JSON.stringify(w.json).includes('s3cret'));
   } finally { await st.close(); }

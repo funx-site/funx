@@ -13,8 +13,8 @@
 // user = { id, email, hash (null until set), role: 'admin'|'user', createdAt }
 //
 // Shipped stores:
-//   MemoryUserStore  tests and `funx api-dev`; lost on restart.
-//   MysqlUserStore   api/store-mysql.js, production (database `funx`).
+//   MemoryUserStore  tests and `funx api-dev`; rows in a memory data store, lost on restart.
+//   MysqlUserStore   api/store-mysql.js, production. Accounts are rows in the platform logical database.
 //   EnvUserStore     read-only list from FUNX_USERS; legacy, no setup links.
 
 const crypto = require('crypto');
@@ -61,38 +61,30 @@ function newSetupToken() { const token = crypto.randomBytes(32).toString('base64
 
 class MemoryUserStore {
   constructor(users = []) {
-    this.byEmail = new Map(); this.tokens = new Map();
-    for (const u of users) this.byEmail.set(normalizeEmail(u.email), { hash: null, role: 'user', ...u, email: normalizeEmail(u.email) });
+    const { MemoryDataStore } = require('./data-store');
+    const { DataUserStore } = require('./platform-data');
+    this.data = new MemoryDataStore();
+    this.inner = new DataUserStore(this.data);
+    const seeds = users.map((u) => ({ id: u.id, email: u.email, hash: u.hash == null ? null : u.hash, role: u.role }));
+    this.ready = this._seed(seeds);
   }
-  async checkSetupToken(sha, now = Date.now()) {
-    const t = this.tokens.get(sha);
-    if (!t || t.usedAt || t.expiresAt <= now) return null;
-    const u = await this.getById(t.userId);
-    return u ? { userId: u.id, email: u.email } : null;
+
+  async _seed(seeds) {
+    try {
+      for (const u of seeds) await this.inner.createRaw(u);
+    } catch (e) {
+      this.ready = null;
+      throw e;
+    }
   }
-  async completeSetup(sha, hash, now = Date.now()) {
-    const t = this.tokens.get(sha);
-    if (!t || t.usedAt || t.expiresAt <= now) return null;
-    const u = await this.getById(t.userId);
-    if (!u) return null;
-    t.usedAt = now; u.hash = hash; u.passwordChangedAt = new Date(now).toISOString();
-    return u;
-  }
-  async bootstrap({ id, email, role = 'user', tokenSha256, expiresAt }) {
-    const e = normalizeEmail(email);
-    if (!(await this.getById(id)) && !this.byEmail.has(e)) this.byEmail.set(e, { id, email: e, hash: null, role, createdAt: new Date().toISOString() });
-    if (tokenSha256 && !this.tokens.has(tokenSha256)) this.tokens.set(tokenSha256, { userId: id, expiresAt: Number(expiresAt), usedAt: null });
-    if (tokenSha256) for (const [k, t] of this.tokens) if (k !== tokenSha256 && t.userId === id && !t.usedAt) t.usedAt = Date.now();
-  }
-  async getByEmail(email) { return this.byEmail.get(normalizeEmail(email)) || null; }
-  async getById(id) { return [...this.byEmail.values()].find((u) => u.id === id) || null; }
-  async create({ email, hash, role = 'user' }) {
-    const e = normalizeEmail(email);
-    if (this.byEmail.has(e)) throw Object.assign(new Error('email taken'), { code: 'exists' });
-    const u = { id: newUserId(), email: e, hash, role, createdAt: new Date().toISOString() };
-    this.byEmail.set(e, u);
-    return u;
-  }
+
+  async _ready() { if (this.ready) await this.ready; }
+  async getByEmail(email) { await this._ready(); return this.inner.getByEmail(email); }
+  async getById(id) { await this._ready(); return this.inner.getById(id); }
+  async create(input) { await this._ready(); return this.inner.create(input); }
+  async checkSetupToken(sha, now) { await this._ready(); return this.inner.checkSetupToken(sha, now); }
+  async completeSetup(sha, hash, now) { await this._ready(); return this.inner.completeSetup(sha, hash, now); }
+  async bootstrap(input) { await this._ready(); return this.inner.bootstrap(input); }
 }
 
 class EnvUserStore extends MemoryUserStore {

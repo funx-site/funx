@@ -22,16 +22,13 @@ visitor ──https://<name>.funx.run──> funx-runtime (HK, *.funx.run custom
 ```
 
 ### funx-api (GZ) — the only place with secrets
-* Tables (created on cold start, `CREATE TABLE IF NOT EXISTS`):
-  * `funx_workers(name PK, owner_id, disabled, current_version, created_at, updated_at)`
-  * `funx_worker_versions(name, version CHAR(64) = sha256 of the canonical bundle, entry, bundle MEDIUMTEXT JSON
-    {path: source}, size, created_at, created_by)`; PK (name, version). Deploying the same bundle twice reuses the
-    version. Old versions are kept (rollback = point `current_version` back), pruned to the last 10.
-  * `funx_worker_bindings(name, kind 'var'|'secret', bkey, value TEXT NULL, ciphertext BLOB NULL)`; PK (name, bkey).
+* Accounts, workers, versions and bindings are rows in the platform logical database (owner `funx`, name `platform`), in `funx_udata` with every other logical row. See [DATA.md](DATA.md).
+  * A version's primary key is `<name>@<sha256 of the canonical bundle>`. Deploying the same bundle twice reuses it. Older versions stay so `current_version` can point back, and are pruned to the newest 10, always keeping the current one.
+  * A binding's primary key is `<name>@<KEY>`, kind `var` or `secret`. A secret is sealed and its `value` is null.
 * Secrets are encrypted with AES-256-GCM, key `FUNX_SECRETS_KEY` (32 random bytes, base64) held **only in
   funx-api's env** **[R1]**; AAD = `funx-secret:v1:<worker>:<KEY>` so a ciphertext can't be moved to another worker
   or key. The API never returns secret values to users (names only), as before.
-* Kill switch = `funx_workers.disabled` flag. `disable` takes effect at the runtime within the cache TTL (≤ 5 s).
+* Kill switch = the worker row's `disabled` flag. `disable` takes effect at the runtime within the cache TTL (≤ 5 s).
 * Runtime endpoint **[R2]**: `GET /v1/runtime/workers/<name>` (optional `?have=<version>` -> `{unchanged: true, disabled}`
     without code or env when the version is current).
   * Accepts only `Authorization: Bearer <runtime token>`. funx-api stores only its SHA-256
@@ -68,6 +65,7 @@ imports between the uploaded files (`.js`, `.mjs`; `.json` imported as its defau
 is awaited before the instance answers the next request (bounded by the wall limit);
 `ctx.passThroughOnException()` is a no-op. **Not** available: Node APIs, `require`, `process`, `Buffer`, fs,
 timers beyond the wall limit, streaming bodies (bodies are buffered), WebSocket, Cache API, KV/D1/R2/DO.
+Logical databases ([docs/DATA.md](DATA.md)) are rows in funx-api, not a binding inside the isolate.
 The same worker code runs unchanged on Cloudflare Workers / workerd, so swapping the runtime to workerd later
 changes only `funx-runtime`, not funx-api, the CLI or the console.
 
