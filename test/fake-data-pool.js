@@ -90,8 +90,11 @@ function fakeDataPool() {
     const lim = s.match(/ LIMIT (\d+)$/);
     if (lim && s.startsWith('SELECT pk, doc, updated_at FROM funx_udata') && s.includes('ORDER BY pk LIMIT')) {
       const n = Number(lim[1]);
-      const rows = state.funx_udata.filter((r) => r.udb_id === params[0] && r.utbl_id === params[1] && udataInRange(s, r.pk, params)).sort((a, b) => cmpPk(a.pk, b.pk));
+      const rows = state.funx_udata.filter((r) => r.udb_id === params[0] && r.utbl_id === params[1] && r.pk !== '\u0000' && udataInRange(s, r.pk, params)).sort((a, b) => cmpPk(a.pk, b.pk));
       return [rows.slice(0, n)];
+    }
+    if (s.startsWith('SELECT doc FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?')) {
+      return [state.funx_udata.filter((r) => r.udb_id === params[0] && r.utbl_id === params[1] && r.pk === params[2]).map((r) => ({ doc: r.doc }))];
     }
     if (s.startsWith('SELECT pk, doc, updated_at FROM funx_udata WHERE udb_id = ? AND utbl_id = ? AND pk = ?')) {
       return [state.funx_udata.filter((r) => r.udb_id === params[0] && r.utbl_id === params[1] && r.pk === params[2])];

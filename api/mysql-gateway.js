@@ -7,7 +7,13 @@
 // It starts when FUNX_MYSQL_PORT is set, on a process that can accept TCP.
 
 const net = require('net');
+const tls = require('tls');
+const { Duplex } = require('stream');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
 const { verifyMysqlUser } = require('./mysql-auth');
 const { forEachStatement, newSession, sqlError, SERVER_VERSION, splitStatements } = require('./mysql-sql');
 
@@ -26,6 +32,7 @@ const CAPS = 0x00000001 // LONG_PASSWORD
   | 0x00100000 // CONNECT_ATTRS
   | 0x00200000 // PLUGIN_AUTH_LENENC_CLIENT_DATA
   | 0x00800000; // SESSION_TRACK
+const CLIENT_SSL = 0x00000800;
 const MULTI_STATEMENTS = 0x00010000;
 const DEPRECATE_EOF = 0x01000000;
 const CONNECT_WITH_DB = 0x00000008;
@@ -46,6 +53,35 @@ const COM_STMT_FETCH = 0x1c;
 const COM_RESET = 0x1f;
 
 let nextConn = 1;
+let tlsMaterialCache;
+
+function gatewayTls() {
+  if (tlsMaterialCache !== undefined) return tlsMaterialCache;
+  try {
+    if (process.env.FUNX_MYSQL_TLS_CERT && process.env.FUNX_MYSQL_TLS_KEY) {
+      tlsMaterialCache = {
+        cert: fs.readFileSync(process.env.FUNX_MYSQL_TLS_CERT),
+        key: fs.readFileSync(process.env.FUNX_MYSQL_TLS_KEY),
+      };
+    } else {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'funx-mysql-'));
+      const keyPath = path.join(dir, 'key.pem');
+      const certPath = path.join(dir, 'cert.pem');
+      execFileSync('openssl', [
+        'req', '-x509', '-newkey', 'rsa:2048', '-keyout', keyPath, '-out', certPath,
+        '-days', '3650', '-nodes', '-subj', '/CN=funx',
+      ], { stdio: 'ignore' });
+      tlsMaterialCache = { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) };
+    }
+  } catch {
+    tlsMaterialCache = null;
+  }
+  return tlsMaterialCache;
+}
+
+function serverCaps() {
+  return CAPS | (gatewayTls() ? CLIENT_SSL : 0);
+}
 
 function scramble20() {
   const b = crypto.randomBytes(20);
@@ -111,6 +147,7 @@ function serverStatus(session, more) {
 }
 
 function handshakePacket(connId, scramble) {
+  const caps = serverCaps();
   const version = Buffer.from(SERVER_VERSION, 'utf8');
   const plugin = Buffer.from('mysql_native_password', 'latin1');
   const payload = Buffer.alloc(68 + version.length);
@@ -124,12 +161,12 @@ function handshakePacket(connId, scramble) {
   scramble.copy(payload, o, 0, 8);
   o += 8;
   payload[o++] = 0;
-  payload.writeUInt16LE(CAPS & 0xffff, o);
+  payload.writeUInt16LE(caps & 0xffff, o);
   o += 2;
   payload[o++] = 45;
   payload.writeUInt16LE(2, o);
   o += 2;
-  payload.writeUInt16LE((CAPS >>> 16) & 0xffff, o);
+  payload.writeUInt16LE((caps >>> 16) & 0xffff, o);
   o += 2;
   payload[o++] = 21;
   o += 10;
@@ -142,9 +179,9 @@ function handshakePacket(connId, scramble) {
   return payload.subarray(0, o);
 }
 
-function okPacket(session, affected, more) {
+function okPacket(session, affected, more, insertId) {
   const aff = lenenc(affected || 0);
-  const ins = lenenc(0);
+  const ins = lenenc(insertId || 0);
   const b = Buffer.alloc(1 + aff.length + ins.length + 4);
   b[0] = 0x00;
   aff.copy(b, 1);
@@ -187,8 +224,13 @@ function columnPacket(column, schema, table) {
   let flags = 0;
   if (column.type === 'int') { type = 0x08; charset = 63; length = 20; flags |= 32768; }
   else if (column.type === 'bool') { type = 0x01; charset = 63; length = 1; flags |= 32768; }
+  else if (column.type === 'float') { type = 0x05; charset = 63; length = 22; flags |= 32768; }
+  else if (column.type === 'decimal') { type = 0xf6; charset = 63; length = 66; flags |= 32768; }
+  else if (column.type === 'datetime') { type = 0x0c; charset = 63; length = 19; flags |= 128; }
+  else if (column.type === 'blob') { type = 0xfc; charset = 63; length = 65535; flags |= 144; }
   else if (column.type === 'json') { type = 0xf5; charset = 63; length = 0xffffff; }
   if (column.primary) flags |= 3;
+  else if (column.nullable === false) flags |= 1;
   const fixed = Buffer.alloc(13);
   fixed[0] = 0x0c;
   fixed.writeUInt16LE(charset, 1);
@@ -199,17 +241,131 @@ function columnPacket(column, schema, table) {
   return Buffer.concat([
     lenencStr('def'),
     lenencStr(schema || ''),
-    lenencStr(table || ''),
-    lenencStr(table || ''),
+    lenencStr(column.table || table || ''),
+    lenencStr(column.table || table || ''),
     lenencStr(column.name),
     lenencStr(column.name),
     fixed,
   ]);
 }
 
-function textCell(value) {
+function textCell(column, value) {
   if (value == null) return Buffer.from([0xfb]);
+  if (column && column.type === 'blob') {
+    const buf = Buffer.from(String(value), 'base64');
+    return Buffer.concat([lenenc(buf.length), buf]);
+  }
+  if (column && column.type === 'json') return lenencStr(typeof value === 'string' ? value : JSON.stringify(value));
+  if (column && column.type === 'bool') return lenencStr(value ? '1' : '0');
   return lenencStr(typeof value === 'string' ? value : String(value));
+}
+
+function binaryRow(columns, values) {
+  const bitmapLen = Math.floor((columns.length + 7 + 2) / 8);
+  const bitmap = Buffer.alloc(bitmapLen);
+  const bodies = [];
+  columns.forEach((column, i) => {
+    const value = values[i];
+    if (value == null) {
+      const bit = i + 2;
+      bitmap[bit >> 3] |= 1 << (bit & 7);
+      return;
+    }
+    bodies.push(binaryValue(column, value));
+  });
+  return Buffer.concat([Buffer.from([0x00]), bitmap, ...bodies]);
+}
+
+function binaryValue(column, value) {
+  if (column.type === 'int') {
+    const b = Buffer.alloc(8);
+    b.writeBigInt64LE(BigInt(Math.trunc(Number(value))));
+    return b;
+  }
+  if (column.type === 'bool') return Buffer.from([value ? 1 : 0]);
+  if (column.type === 'float') {
+    const b = Buffer.alloc(8);
+    b.writeDoubleLE(Number(value));
+    return b;
+  }
+  if (column.type === 'datetime') {
+    const m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2}))?/.exec(String(value));
+    if (!m) return Buffer.from([0]);
+    const b = Buffer.alloc(m[4] == null ? 5 : 8);
+    b[0] = m[4] == null ? 4 : 7;
+    b.writeUInt16LE(Number(m[1]), 1);
+    b[3] = Number(m[2]);
+    b[4] = Number(m[3]);
+    if (m[4] != null) { b[5] = Number(m[4]); b[6] = Number(m[5]); b[7] = Number(m[6]); }
+    return b;
+  }
+  if (column.type === 'blob') {
+    const buf = Buffer.from(String(value), 'base64');
+    return Buffer.concat([lenenc(buf.length), buf]);
+  }
+  const text = column.type === 'json' && typeof value !== 'string' ? JSON.stringify(value) : String(value);
+  return lenencStr(text);
+}
+
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+function readExecuteParams(payload, n) {
+  if (!n) return [];
+  let o = 10;
+  const nullLen = (n + 7) >> 3;
+  const nulls = payload.subarray(o, o + nullLen);
+  o += nullLen;
+  if (payload[o] !== 1) throw sqlError(1064, 'prepared parameters were not bound');
+  o += 1;
+  const types = [];
+  for (let i = 0; i < n; i++) {
+    types.push(payload[o]);
+    o += 2;
+  }
+  const values = [];
+  for (let i = 0; i < n; i++) {
+    if (nulls[i >> 3] & (1 << (i & 7))) { values.push(null); continue; }
+    const t = types[i];
+    if (t === 0x06) { values.push(null); continue; }
+    if (t === 0x01) { values.push(payload.readInt8(o)); o += 1; continue; }
+    if (t === 0x02) { values.push(payload.readInt16LE(o)); o += 2; continue; }
+    if (t === 0x03) { values.push(payload.readInt32LE(o)); o += 4; continue; }
+    if (t === 0x08) { values.push(Number(payload.readBigInt64LE(o))); o += 8; continue; }
+    if (t === 0x04) { values.push(payload.readFloatLE(o)); o += 4; continue; }
+    if (t === 0x05) { values.push(payload.readDoubleLE(o)); o += 8; continue; }
+    if (t === 0x0a || t === 0x0c || t === 0x07) {
+      const len = payload[o++];
+      if (len < 4) { values.push(null); continue; }
+      const y = payload.readUInt16LE(o); o += 2;
+      const m = payload[o++];
+      const d = payload[o++];
+      let H = 0; let M = 0; let S = 0;
+      if (len >= 7) { H = payload[o++]; M = payload[o++]; S = payload[o++]; }
+      if (len >= 11) o += 4;
+      values.push(len >= 7 ? `${String(y).padStart(4, '0')}-${pad2(m)}-${pad2(d)} ${pad2(H)}:${pad2(M)}:${pad2(S)}` : `${String(y).padStart(4, '0')}-${pad2(m)}-${pad2(d)}`);
+      continue;
+    }
+    const [len, next] = readLenenc(payload, o);
+    const buf = payload.subarray(next, next + (len || 0));
+    o = next + (len || 0);
+    if (t === 0xfc) values.push(buf.toString('base64'));
+    else if (t === 0xf5) {
+      const s = buf.toString('utf8');
+      try { values.push(JSON.parse(s)); } catch { values.push(s); }
+    } else values.push(buf.toString('utf8'));
+  }
+  return values;
+}
+
+function preparePacket(id, paramCount) {
+  const b = Buffer.alloc(12);
+  b[0] = 0;
+  b.writeUInt32LE(id, 1);
+  b.writeUInt16LE(0, 5);
+  b.writeUInt16LE(paramCount, 7);
+  b[9] = 0;
+  b.writeUInt16LE(0, 10);
+  return b;
 }
 
 function parseClientHello(payload) {
@@ -246,10 +402,12 @@ function createReader(socket) {
   let waiting = null;
   let closed = false;
   const wake = () => { if (waiting) { const w = waiting; waiting = null; w(); } };
-  socket.on('data', (chunk) => { buf = buf.length ? Buffer.concat([buf, chunk]) : chunk; wake(); });
-  socket.on('error', () => { closed = true; wake(); });
-  socket.on('end', () => { closed = true; wake(); });
-  socket.on('close', () => { closed = true; wake(); });
+  const onData = (chunk) => { buf = buf.length ? Buffer.concat([buf, chunk]) : chunk; wake(); };
+  const onEnd = () => { closed = true; wake(); };
+  socket.on('data', onData);
+  socket.on('error', onEnd);
+  socket.on('end', onEnd);
+  socket.on('close', onEnd);
   async function need(n) {
     while (buf.length < n) {
       if (closed) return false;
@@ -271,6 +429,16 @@ function createReader(socket) {
         if (len < MAX_PACKET) break;
       }
       return { seq, payload: parts.length === 1 ? parts[0] : Buffer.concat(parts) };
+    },
+    detach() {
+      socket.off('data', onData);
+      socket.off('error', onEnd);
+      socket.off('end', onEnd);
+      socket.off('close', onEnd);
+      const left = buf;
+      buf = Buffer.alloc(0);
+      closed = true;
+      return left;
     },
   };
 }
@@ -309,15 +477,50 @@ async function sendErr(socket, seq, errno, message, sqlState) {
   await send(socket, seq, errPacket(errno, sqlState, message));
 }
 
-async function writeResult(socket, seq, session, result, more, flags) {
+async function writeResult(socket, seq, session, result, more, flags, binary) {
   const deprecate = (flags & DEPRECATE_EOF) !== 0;
-  if (result.kind === 'ok') return send(socket, seq, okPacket(session, result.affectedRows, more));
+  if (result.kind === 'ok') return send(socket, seq, okPacket(session, result.affectedRows, more, result.insertId));
   const schema = session.database || '';
   seq = await send(socket, seq, lenenc(result.columns.length));
   for (const column of result.columns) seq = await send(socket, seq, columnPacket(column, schema, ''));
   if (!deprecate) seq = await send(socket, seq, eofPacket(serverStatus(session, false), false));
-  for (const row of result.rows) seq = await send(socket, seq, Buffer.concat(row.map(textCell)));
+  for (const row of result.rows) {
+    const body = binary ? binaryRow(result.columns, row) : Buffer.concat(row.map((value, i) => textCell(result.columns[i], value)));
+    seq = await send(socket, seq, body);
+  }
   return send(socket, seq, eofPacket(serverStatus(session, more), deprecate));
+}
+
+function prependSocket(socket, head) {
+  const stream = new Duplex({
+    read() {},
+    write(chunk, enc, cb) { socket.write(chunk, cb); },
+  });
+  if (head.length) stream.push(head);
+  socket.on('data', (chunk) => stream.push(chunk));
+  socket.on('end', () => stream.push(null));
+  socket.on('error', (err) => stream.destroy(err));
+  stream.on('error', () => socket.destroy());
+  stream.on('close', () => socket.destroy());
+  return stream;
+}
+
+function promoteTls(socket, reader, material) {
+  const left = reader.detach();
+  const secure = new tls.TLSSocket(prependSocket(socket, left), {
+    isServer: true,
+    secureContext: tls.createSecureContext({ cert: material.cert, key: material.key }),
+  });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(Object.assign(new Error('tls handshake timed out'), { errno: 2026 })), 5000);
+    const fail = (err) => { clearTimeout(timer); reject(err); };
+    secure.once('error', fail);
+    secure.once('secure', () => {
+      clearTimeout(timer);
+      secure.off('error', fail);
+      resolve({ socket: secure, reader: createReader(secure) });
+    });
+  });
 }
 
 function makeThrottle() {
@@ -344,7 +547,12 @@ async function commandLoop(socket, reader, dataStore, session, flags) {
     const cmd = pkt.payload[0];
     let seq = (pkt.seq + 1) & 0xff;
     if (cmd === COM_QUIT) return;
-    if (cmd === COM_PING || cmd === COM_STMT_CLOSE || cmd === COM_STMT_RESET) {
+    if (cmd === COM_STMT_CLOSE) {
+      const id = pkt.payload.length >= 5 ? pkt.payload.readUInt32LE(1) : 0;
+      if (session.statements) session.statements.delete(id);
+      continue;
+    }
+    if (cmd === COM_PING || cmd === COM_STMT_RESET) {
       await send(socket, seq, okPacket(session, 0, false));
       continue;
     }
@@ -357,6 +565,8 @@ async function commandLoop(socket, reader, dataStore, session, flags) {
       session.autocommit = true;
       session.explicitTx = false;
       session.overlay = null;
+      session.params = null;
+      if (session.statements) session.statements.clear();
       await send(socket, seq, okPacket(session, 0, false));
       continue;
     }
@@ -388,32 +598,86 @@ async function commandLoop(socket, reader, dataStore, session, flags) {
       }
       continue;
     }
-    if (cmd === COM_STMT_PREPARE || cmd === COM_STMT_EXECUTE || cmd === COM_STMT_FETCH) {
-      await sendErr(socket, seq, 1295, 'prepared statements are not supported; send the SQL text', 'HY000');
+    if (cmd === COM_STMT_PREPARE) {
+      const sql = pkt.payload.subarray(1).toString('utf8');
+      try {
+        const parts = splitStatements(sql);
+        if (parts.length !== 1) throw sqlError(1064, 'prepared statement must be one statement');
+        let n = 0;
+        for (const tok of parts[0]) if (tok.t === 'op' && tok.v === '?') n++;
+        const id = session.nextStmt++;
+        session.statements.set(id, { sql, params: n });
+        seq = await send(socket, seq, preparePacket(id, n));
+        for (let i = 0; i < n; i++) seq = await send(socket, seq, columnPacket({ name: '?', type: 'string' }, '', ''));
+        if (n) await send(socket, seq, eofPacket(serverStatus(session, false), false));
+      } catch (e) {
+        const err = e && e.errno ? e : sqlError(1064, 'bad statement', '42000');
+        await sendErr(socket, seq, err.errno, err.message, err.sqlState);
+      }
+      continue;
+    }
+    if (cmd === COM_STMT_EXECUTE) {
+      const id = pkt.payload.length >= 5 ? pkt.payload.readUInt32LE(1) : 0;
+      const prepared = session.statements && session.statements.get(id);
+      if (!prepared) {
+        await sendErr(socket, seq, 1243, `unknown prepared statement ${id}`, 'HY000');
+        continue;
+      }
+      try {
+        session.params = readExecuteParams(pkt.payload, prepared.params);
+        await forEachStatement(dataStore, session, prepared.sql, async (result, more) => {
+          seq = await writeResult(socket, seq, session, result, more, flags, true);
+        });
+      } catch (e) {
+        const err = e && e.errno ? e : sqlError(1105, 'internal error', 'HY000');
+        await sendErr(socket, seq, err.errno, err.message, err.sqlState);
+      } finally {
+        session.params = null;
+      }
+      continue;
+    }
+    if (cmd === COM_STMT_FETCH) {
+      await sendErr(socket, seq, 1235, 'cursors are not supported', 'HY000');
       continue;
     }
     await sendErr(socket, seq, 1047, 'unknown command', '08S01');
   }
 }
 
-async function handleSocket(socket, dataStore, throttle) {
+async function handleSocket(rawSocket, dataStore, throttle) {
+  let socket = rawSocket;
   socket.setNoDelay(true);
   socket.setKeepAlive(true, 60000);
   socket.setTimeout(15 * 60 * 1000, () => socket.destroy());
-  const reader = createReader(socket);
+  let reader = createReader(socket);
   const connId = nextConn++;
   const scramble = scramble20();
+  const peer = clientHost(rawSocket);
   try {
     await send(socket, 0, handshakePacket(connId >>> 0, scramble));
-    const hello = await reader.read();
+    let hello = await reader.read();
     if (!hello) return;
+    if (hello.payload.length === 32) {
+      const asked = hello.payload.readUInt32LE(0);
+      const material = gatewayTls();
+      if ((asked & CLIENT_SSL) === 0 || !material) {
+        await sendErr(socket, (hello.seq + 1) & 0xff, 2026, 'TLS is not enabled on this port', 'HY000');
+        return;
+      }
+      const upgraded = await promoteTls(socket, reader, material);
+      socket = upgraded.socket;
+      reader = upgraded.reader;
+      socket.setTimeout(15 * 60 * 1000, () => socket.destroy());
+      hello = await reader.read();
+      if (!hello) return;
+    }
     const seq = (hello.seq + 1) & 0xff;
-    if (hello.payload.length <= 32) {
+    if (hello.payload.length < 33) {
       await sendErr(socket, seq, 2026, 'TLS is not enabled on this port', 'HY000');
       return;
     }
     const client = parseClientHello(hello.payload);
-    const host = clientHost(socket);
+    const host = peer;
     if (!client || throttle.blocked(host)) {
       await sendErr(socket, seq, 1045, `Access denied for user '${client ? client.user : ''}'@'${host}' (using password: YES)`, '28000');
       return;

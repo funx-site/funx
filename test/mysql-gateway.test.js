@@ -40,9 +40,17 @@ test('sql: create, read, update, delete, and the session transaction', async () 
   assert.deepEqual(left[0].rows, [['a']]);
   await executeSql(store, s, "DELETE FROM notes WHERE id = 'a'");
   assert.deepEqual((await executeSql(store, s, 'SELECT id FROM notes'))[0].rows, []);
-  await assert.rejects(sql(store, 'u1', 'CREATE TABLE bad (id INT PRIMARY KEY)', 'app'), (e) => e.errno === 1235);
-  await assert.rejects(sql(store, 'u1', 'SELECT * FROM notes JOIN notes x', 'app'), (e) => e.errno === 1235);
-  await assert.rejects(sql(store, 'u1', "INSERT INTO notes (id, title) VALUES ('a', '" + 'x'.repeat(40000) + "')", 'app'), (e) => e.errno === 1406);
+  await executeSql(store, s, 'CREATE TABLE users (id INT AUTO_INCREMENT PRIMARY KEY, email VARCHAR(255) NOT NULL UNIQUE, name VARCHAR(64), created_at DATETIME DEFAULT CURRENT_TIMESTAMP)');
+  const ins = await executeSql(store, s, "INSERT INTO users (email, name) VALUES ('a@b.c', 'ada')");
+  assert.equal(ins[0].insertId, 1);
+  await executeSql(store, s, 'CREATE TABLE posts (id INT AUTO_INCREMENT PRIMARY KEY, user_id INT, title VARCHAR(255), body TEXT)');
+  await executeSql(store, s, "INSERT INTO posts (user_id, title) VALUES (1, 'hi')");
+  const joined = await executeSql(store, s, "SELECT u.email, p.title FROM users u JOIN posts p ON u.id = p.user_id WHERE u.email = 'a@b.c' OR u.name = 'nope'");
+  assert.deepEqual(joined[0].rows, [['a@b.c', 'hi']]);
+  assert.deepEqual((await executeSql(store, s, 'SELECT COUNT(*) AS n FROM posts'))[0].rows, [[1]]);
+  await executeSql(store, s, "INSERT INTO notes (id, title) VALUES ('wide', '" + 'x'.repeat(40000) + "')");
+  assert.equal((await executeSql(store, s, "SELECT id FROM notes WHERE id = 'wide'"))[0].rows.length, 1);
+  await assert.rejects(sql(store, 'u1', "INSERT INTO notes (id, title) VALUES ('huge', '" + 'x'.repeat(4 * 1024 * 1024) + "')", 'app'), (e) => e.errno === 1406);
   const other = await executeSql(store, session('u2'), 'SHOW DATABASES');
   assert.deepEqual(other[0].rows.map((r) => r[0]).filter((n) => n !== 'information_schema'), []);
   await assert.rejects(executeSql(store, session('u2'), 'USE app'), (e) => e.errno === 1049);
@@ -98,8 +106,12 @@ test('mysql protocol: a client connects with host, port, user and password', asy
     const [after] = await conn.query('SELECT id FROM notes');
     assert.deepEqual(after.map((r) => r.id), ['a']);
     await assert.rejects(conn.query("INSERT INTO notes (id, title) VALUES ('a', 'dup')"), (e) => e.errno === 1062);
-    await assert.rejects(conn.query('CREATE TABLE bad (id INT PRIMARY KEY, name VARCHAR(16))'), (e) => e.errno === 1235);
-    await assert.rejects(conn.execute('SELECT 1'), (e) => e.errno === 1295);
+    await conn.query('CREATE TABLE seq (id INT NOT NULL AUTO_INCREMENT, name VARCHAR(32), PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+    const [made] = await conn.execute('INSERT INTO seq (name) VALUES (?)', ['a']);
+    assert.equal(made.insertId, 1);
+    const [gotId] = await conn.execute('SELECT id, name FROM seq WHERE id = ?', [1]);
+    assert.equal(gotId[0].id, 1);
+    assert.equal(gotId[0].name, 'a');
     const [still] = await conn.query('SELECT 1 AS n');
     assert.equal(still[0].n, 1);
     const row = await store.getRow('u1', 'app', 'notes', 'a');
@@ -186,6 +198,66 @@ test('http: /v1/mysql returns a connection string and the password only on reset
     if (conn) await conn.end();
     await srv.close();
     await closedSrv.close();
+    await gw.close();
+  }
+});
+
+test('mysql protocol: an application changes only host, port, user and password', async () => {
+  const store = new MemoryDataStore();
+  const gw = await startMysqlGateway({ dataStore: store, port: 0 });
+  const account = await rotateMysqlPassword(store, 'shop');
+  let conn;
+  try {
+    conn = await mysql.createConnection(clientOpts(gw.port, account.user, account.password, {
+      ssl: { rejectUnauthorized: false },
+      dateStrings: true,
+    }));
+    await conn.query('CREATE DATABASE shop');
+    await conn.query('USE shop');
+    await conn.query(`CREATE TABLE users (
+      id INT NOT NULL AUTO_INCREMENT,
+      email VARCHAR(255) NOT NULL,
+      name VARCHAR(255) NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY email (email)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    await conn.query(`CREATE TABLE posts (
+      id INT NOT NULL AUTO_INCREMENT,
+      user_id INT NULL,
+      title VARCHAR(255) NULL,
+      body TEXT NULL,
+      PRIMARY KEY (id),
+      KEY user_id (user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    const [ada] = await conn.execute('INSERT INTO users (email, name) VALUES (?, ?)', ['ada@funx.test', 'Ada']);
+    const [grace] = await conn.execute('INSERT INTO users (email, name) VALUES (?, ?)', ['grace@funx.test', 'Grace']);
+    assert.equal(ada.insertId, 1);
+    assert.equal(grace.insertId, 2);
+    await conn.execute('INSERT INTO posts (user_id, title, body) VALUES (?, ?, ?)', [ada.insertId, 'hello', 'first']);
+    await conn.execute('INSERT INTO posts (user_id, title, body) VALUES (?, ?, ?)', [ada.insertId, 'next', null]);
+    const [joined] = await conn.execute(
+      'SELECT u.email, p.title FROM users u INNER JOIN posts p ON u.id = p.user_id WHERE u.email = ? OR u.name = ? ORDER BY p.id',
+      ['ada@funx.test', 'nobody'],
+    );
+    assert.deepEqual(joined.map((r) => [r.email, r.title]), [['ada@funx.test', 'hello'], ['ada@funx.test', 'next']]);
+    const [counted] = await conn.query('SELECT user_id, COUNT(*) AS n FROM posts GROUP BY user_id');
+    assert.equal(Number(counted[0].n), 2);
+    const [dup] = await conn.query("INSERT INTO users (email, name) VALUES ('ada@funx.test', 'Ada') ON DUPLICATE KEY UPDATE name = 'Ada Lovelace'");
+    assert.equal(dup.affectedRows, 2);
+    const [named] = await conn.query("SELECT name FROM users WHERE email = 'ada@funx.test'");
+    assert.equal(named[0].name, 'Ada Lovelace');
+    const [idx] = await conn.query('SHOW INDEX FROM users');
+    assert.ok(idx.some((r) => r.Key_name === 'email' && r.Column_name === 'email'));
+    const row = await store.getRow('shop', 'shop', 'users', '1');
+    assert.equal(row.values.email, 'ada@funx.test');
+    assert.equal(row.pk, '1');
+    const [bumped] = await conn.query('UPDATE posts SET title = CONCAT(title, ?) WHERE id = 1', ['!']);
+    assert.equal(bumped.affectedRows, 1);
+    const [title] = await conn.query('SELECT title FROM posts WHERE id = 1');
+    assert.equal(title[0].title, 'hello!');
+  } finally {
+    if (conn) await conn.end();
     await gw.close();
   }
 });

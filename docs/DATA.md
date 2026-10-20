@@ -4,7 +4,7 @@ An account can create databases. That does not create a MySQL database, a user, 
 
 This is not `env.DB` and not a D1 binding. Worker code does not receive a database handle. An account connects the way it would connect to any other cloud MySQL: host, port, user, password, and SQL. Those statements read and write the same `funx_udata` rows as the HTTP API. Creating a database is still one catalog row. It does not create a physical database.
 
-The MySQL listener is a TCP port on the API process (`FUNX_MYSQL_PORT`, bound on `0.0.0.0`). The host printed in connection strings is `FUNX_MYSQL_HOST` (default `127.0.0.1`). SCF Web functions only accept HTTP on `:9000`, so that HTTP port is not the MySQL port. Turn the listener on where the process can accept TCP. The wire protocol is the text protocol with `mysql_native_password`. See [API.md](API.md) for the SQL that works and the parts that answer with an error.
+The MySQL listener is a TCP port on the API process (`FUNX_MYSQL_PORT`, bound on `0.0.0.0`). The host printed in connection strings is `FUNX_MYSQL_HOST` (default `127.0.0.1`). SCF Web functions only accept HTTP on `:9000`, so that HTTP port is not the MySQL port. Turn the listener on where the process can accept TCP. The wire protocol is MySQL with `mysql_native_password`, including prepared statements. TLS is offered when the client asks; set `FUNX_MYSQL_TLS_CERT` and `FUNX_MYSQL_TLS_KEY`, or the process generates a self-signed certificate. See [API.md](API.md) for the SQL that works and the parts that answer with an error.
 
 ## Tables
 
@@ -17,7 +17,7 @@ Catalog and rows for node 0 live in the existing `funx` database, created on fir
 | `funx_utbl` | One logical table. `columns_json` is the schema. Names are unique per logical database. |
 | `funx_udata` | **All user rows**, on the node that owns them. Primary key `(udb_id, utbl_id, pk)`. |
 
-`funx_udata.pk` is a non-empty string of at most 255 characters. The primary column's type is `string`, so `ORDER BY pk` and `pk > ?` use that index. Integer, boolean and JSON values live in `doc`.
+`funx_udata.pk` is a non-empty string of at most 255 characters. A string primary key is stored as itself, so `ORDER BY pk` and `pk > ?` use that index and HTTP cursors stay stable. An integer primary key is stored as a sortable encoding of the number; the value a client sees is still the integer. A hidden row whose primary key is a single NUL byte holds auto-increment and unique-index metadata for tables that need it. Other column values live in `doc`. The HTTP API accepts only a string primary key. The MySQL path also accepts integer keys, `DOUBLE`, `DECIMAL`, `DATETIME`, and `BLOB`.
 
 A point read is:
 
@@ -48,7 +48,7 @@ Existing logical databases keep their `node_id` and stay on the old pool. New ac
 
 ## Limits
 
-32 databases per account, 64 tables per database, 32 columns per table, 32 KB per row, 100 rows per list call. A column may only declare `name`, `type` and `primary`. Anything else is rejected, so a property we do not store is not silently ignored.
+32 databases per account, 64 tables per database, 128 columns per table, 100 rows per list call. The HTTP API caps a row at 32 KB and accepts only `name`, `type`, and `primary` on a column. The MySQL path caps a row at 4 MB and stores defaults, nullability, auto-increment, and indexes in `columns_json`. Non-unique indexes are metadata for `SHOW INDEX`; a `UNIQUE` index is enforced.
 
 ## Platform database
 

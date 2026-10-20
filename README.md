@@ -92,7 +92,7 @@ skills/     worker-cli points at funx-site/skill; platform-ops-cli stays (platfo
 AGENTS.md   agent guide: user deploys via sibling skill + CLI; GitHub CI for platform functions once wired
 router/     funx-router web function (no dependencies)
 shim/       funx_entry.cjs (Workers runtime) + scf_bootstrap, added to every user package
-api/        funx-api web function: app.js (routes), jwt.js (ES256/JWKS), users.js (scrypt, stores), data-store.js (logical databases), platform-data.js (accounts and workers as rows), mysql-gateway.js (MySQL text protocol), server.js (SCF entry)
+api/        funx-api web function: app.js (routes), jwt.js (ES256/JWKS), users.js (scrypt, stores), data-store.js (logical databases), platform-data.js (accounts and workers as rows), mysql-gateway.js (MySQL protocol), server.js (SCF entry)
 console/    web console, plain static files (index.html, app.css, js/, vendor/codemirror.js)
 lib/        name rules, header hygiene, router map format, vars/secrets bindings (shared)
 docs/API.md funx-api reference

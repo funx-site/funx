@@ -1,17 +1,20 @@
 'use strict';
-// A small SQL surface over one account's logical databases.
-// Enough for the mysql client, a GUI, and an application connection string:
-// create and drop databases and tables, insert, select, update, delete.
-// Joins, secondary indexes, and non-string primary keys are refused.
+// SQL for one account's logical databases.
+// Rows stay in funx_udata. The MySQL path accepts the statements a typical
+// application sends: typed primary keys, joins, grouping, defaults, and placeholders.
+// The HTTP API keeps its own stricter schema.
 
 const { cmpPk } = require('./data-store');
 
 const SERVER_VERSION = '5.7.40-funx';
+const SQL_MAX_BYTES = 4 * 1024 * 1024;
+const AGG = new Set(['count', 'sum', 'min', 'max', 'avg']);
 const RESERVED = new Set(`from where and or order group limit offset set values into table database
 select insert update delete create drop show use primary key not null as by asc desc like join left
 right inner on if exists replace start commit rollback begin transaction describe desc columns
 databases tables variables status full schema character charset collate comment default unique index
-constraint references check auto_increment ignore replace into`.split(/\s+/));
+constraint references check auto_increment ignore replace into distinct between in is cross outer
+using having union all`.split(/\s+/));
 
 function sqlError(errno, message, sqlState = '42000') {
   return Object.assign(new Error(message), { errno, sqlState });
@@ -85,12 +88,16 @@ function tokenize(sql) {
       i += 2 + m[0].length;
       continue;
     }
-    if (c === '-' && /[0-9]/.test(s[i + 1]) || /[0-9]/.test(c)) {
-      const m = /^-?\d+/.exec(s.slice(i));
+    const dotNum = c === '.' && /[0-9]/.test(s[i + 1] || '');
+    const negNum = c === '-' && (/[0-9]/.test(s[i + 1] || '') || (s[i + 1] === '.' && /[0-9]/.test(s[i + 2] || '')));
+    if (dotNum || negNum || /[0-9]/.test(c)) {
+      const m = /^-?(?:\d+\.\d+|\d+\.|\.\d+|\d+)/.exec(s.slice(i));
       if (!m) throw sqlError(1064, 'bad number');
-      if (s[i + m[0].length] === '.') throw sqlError(1235, 'fractional numbers are not supported');
-      push('num', Number(m[0]));
-      i += m[0].length;
+      const raw = m[0];
+      const n = Number(raw);
+      if (!Number.isFinite(n)) throw sqlError(1064, 'bad number');
+      push('num', n);
+      i += raw.length;
       continue;
     }
     if (/[A-Za-z_]/.test(c)) {
@@ -163,7 +170,6 @@ function parseLiteral(p) {
   if (t.t === 'str') { p.eat(); return t.v; }
   if (t.t === 'num') { p.eat(); return t.v; }
   if (t.t === 'word' && t.v.toLowerCase() === 'null') { p.eat(); return null; }
-  if (t.t === 'word' && t.v.toLowerCase() === 'default') { p.eat(); return null; }
   if (t.t === 'word' && (t.v.toLowerCase() === 'true' || t.v.toLowerCase() === 'false')) {
     p.eat();
     return t.v.toLowerCase() === 'true';
@@ -181,153 +187,324 @@ function parseSetValue(p) {
   return parseLiteral(p);
 }
 
+function parseExpr(p) { return parseOr(p); }
+
+function parseOr(p) {
+  let left = parseAnd(p);
+  while (p.takeWord('or')) left = { op: 'or', args: [left, parseAnd(p)] };
+  return left;
+}
+
+function parseAnd(p) {
+  let left = parseNot(p);
+  while (p.takeWord('and')) left = { op: 'and', args: [left, parseNot(p)] };
+  return left;
+}
+
+function parseNot(p) {
+  if (p.takeWord('not')) return { op: 'not', args: [parseNot(p)] };
+  return parsePred(p);
+}
+
+function parsePred(p) {
+  if (p.takeWord('exists')) throw sqlError(1235, 'subqueries are not supported');
+  const left = parseAdd(p);
+  if (p.takeWord('is')) {
+    const not = p.takeWord('not');
+    p.expectWord('null');
+    return { op: 'is', not, args: [left] };
+  }
+  if (p.takeWord('not')) {
+    if (p.takeWord('like')) return { op: 'not', args: [{ op: 'like', args: [left, parseAdd(p)] }] };
+    if (p.takeWord('in')) return { op: 'not', args: [{ op: 'in', args: [left, ...parseList(p)] }] };
+    throw sqlError(1064, 'expected LIKE or IN');
+  }
+  if (p.takeWord('in')) return { op: 'in', args: [left, ...parseList(p)] };
+  if (p.takeWord('like')) return { op: 'like', args: [left, parseAdd(p)] };
+  if (p.takeWord('between')) {
+    const a = parseAdd(p);
+    p.expectWord('and');
+    return { op: 'between', args: [left, a, parseAdd(p)] };
+  }
+  const opTok = p.peek();
+  if (opTok && opTok.t === 'op' && ['=', '!=', '<>', '<', '>', '<=', '>='].includes(opTok.v)) {
+    p.eat();
+    return { op: 'cmp', cmp: opTok.v === '<>' ? '!=' : opTok.v, args: [left, parseAdd(p)] };
+  }
+  return left;
+}
+
+function parseList(p) {
+  p.expectOp('(');
+  if (p.word('select')) throw sqlError(1235, 'subqueries are not supported');
+  const list = [];
+  if (!p.op(')')) {
+    do { list.push(parseExpr(p)); } while (p.takeOp(','));
+  }
+  p.expectOp(')');
+  return list;
+}
+
+function parseAdd(p) {
+  let left = parseMul(p);
+  while (p.peek() && p.peek().t === 'op' && (p.peek().v === '+' || p.peek().v === '-')) {
+    const op = p.eat().v;
+    left = { op, args: [left, parseMul(p)] };
+  }
+  return left;
+}
+
+function parseMul(p) {
+  let left = parseUnary(p);
+  while (p.peek() && p.peek().t === 'op' && (p.peek().v === '*' || p.peek().v === '/')) {
+    const op = p.eat().v;
+    left = { op, args: [left, parseUnary(p)] };
+  }
+  return left;
+}
+
+function parseUnary(p) {
+  if (p.takeOp('-')) return { op: 'neg', args: [parseUnary(p)] };
+  if (p.takeOp('+')) return parseUnary(p);
+  return parsePrimary(p);
+}
+
+function parsePrimary(p) {
+  if (p.takeOp('(')) {
+    if (p.word('select')) throw sqlError(1235, 'subqueries are not supported');
+    const e = parseExpr(p);
+    p.expectOp(')');
+    return e;
+  }
+  if (p.takeOp('?')) return { param: true };
+  const t = p.peek();
+  if (!t) throw sqlError(1064, 'expected an expression');
+  if (t.t === 'str' || t.t === 'num') { p.eat(); return { lit: t.v }; }
+  if (t.t === 'sys') { p.eat(); return { sys: t.v }; }
+  if (t.t === 'word' || t.t === 'id') {
+    const lower = t.t === 'word' ? t.v.toLowerCase() : null;
+    if (lower === 'null') { p.eat(); return { lit: null }; }
+    if (lower === 'true') { p.eat(); return { lit: true }; }
+    if (lower === 'false') { p.eat(); return { lit: false }; }
+    if (lower === 'default') { p.eat(); return { def: true }; }
+    const next = p.tokens[p.i + 1];
+    if (t.t === 'word' && next && next.t === 'op' && next.v === '(') {
+      const name = foldName(p.eat().v);
+      p.expectOp('(');
+      const args = [];
+      let star = false;
+      p.takeWord('distinct');
+      if (!p.takeOp(')')) {
+        if (p.takeOp('*')) star = true;
+        else {
+          do { args.push(parseExpr(p)); } while (p.takeOp(','));
+        }
+        p.expectOp(')');
+      }
+      return { fn: name, args, star };
+    }
+    const name = parseIdent(p, t.t === 'id');
+    if (p.takeOp('.')) {
+      if (p.takeOp('*')) return { star: true, table: name };
+      const col = parseIdent(p, true);
+      return { col, table: name };
+    }
+    return { col: name };
+  }
+  throw sqlError(1064, `expected an expression near ${t.v}`);
+}
+
 function parseType(p) {
   const t = p.peek();
   if (!t || t.t !== 'word') throw sqlError(1064, 'expected a column type');
   p.eat();
   const n = t.v.toLowerCase();
-  let len = null;
+  let mysqlType = n;
   if (p.takeOp('(')) {
     const num = p.peek();
     if (!num || num.t !== 'num') throw sqlError(1064, 'expected a length');
-    len = num.v;
+    mysqlType += `(${num.v}`;
     p.eat();
     if (p.takeOp(',')) {
       if (!p.peek() || p.peek().t !== 'num') throw sqlError(1064, 'expected a length');
+      mysqlType += `,${p.peek().v}`;
       p.eat();
     }
+    mysqlType += ')';
     p.expectOp(')');
   }
-  if (['varchar', 'char', 'text', 'tinytext', 'mediumtext', 'longtext'].includes(n)) return 'string';
-  if (n === 'tinyint' && len === 1) return 'bool';
-  if (n === 'bool' || n === 'boolean') return 'bool';
-  if (['int', 'integer', 'bigint', 'smallint', 'mediumint', 'tinyint'].includes(n)) return 'int';
-  if (n === 'json') return 'json';
-  throw sqlError(1235, `column type ${t.v} is not supported; use VARCHAR, INT, BOOL, or JSON`);
+  if (n === 'double' || n === 'float' || n === 'real') p.takeWord('precision');
+  const len = /^\w+\((\d+)/.exec(mysqlType);
+  const length = len ? Number(len[1]) : null;
+  let type = null;
+  if (['varchar', 'char', 'text', 'tinytext', 'mediumtext', 'longtext'].includes(n)) type = 'string';
+  else if ((n === 'tinyint' && length === 1) || n === 'bool' || n === 'boolean') type = 'bool';
+  else if (['int', 'integer', 'bigint', 'smallint', 'mediumint', 'tinyint'].includes(n)) type = 'int';
+  else if (['float', 'double', 'real'].includes(n)) type = 'float';
+  else if (n === 'decimal' || n === 'numeric') type = 'decimal';
+  else if (['datetime', 'timestamp', 'date', 'time'].includes(n)) type = 'datetime';
+  else if (n === 'json') type = 'json';
+  else if (['blob', 'tinyblob', 'mediumblob', 'longblob', 'binary', 'varbinary'].includes(n)) type = 'blob';
+  if (!type) throw sqlError(1235, `column type ${t.v} is not supported`);
+  return { type, mysqlType };
+}
+
+function skipUntilComma(p) {
+  let depth = 0;
+  while (p.peek()) {
+    if (p.op('(')) { depth++; p.eat(); continue; }
+    if (p.op(')')) {
+      if (depth === 0) return;
+      depth--;
+      p.eat();
+      continue;
+    }
+    if (depth === 0 && p.op(',')) return;
+    p.eat();
+  }
+}
+
+function parseTimeFunc(p) {
+  const w = p.peek();
+  if (!w || w.t !== 'word') return false;
+  const n = w.v.toLowerCase();
+  if (n !== 'current_timestamp' && n !== 'now' && n !== 'current_date' && n !== 'curdate') return false;
+  p.eat();
+  if (p.takeOp('(')) p.expectOp(')');
+  return true;
 }
 
 function parseColumnRest(p, col) {
   while (p.peek() && !p.op(',') && !p.op(')')) {
-    if (p.takeWord('primary')) { p.expectWord('key'); col.primary = true; continue; }
-    if (p.takeWord('not')) { p.takeWord('null'); continue; }
-    if (p.takeWord('null')) continue;
-    if (p.takeWord('default')) { parseLiteral(p); continue; }
-    if (p.takeWord('comment')) { parseLiteral(p); continue; }
-    if (p.takeWord('collate')) { parseIdent(p); continue; }
-    if (p.takeWord('character')) { p.takeWord('set'); parseIdent(p); continue; }
-    if (p.takeWord('charset')) { parseIdent(p); continue; }
-    if (p.takeWord('auto_increment')) continue;
-    const w = p.peek();
-    if (w && w.t === 'word' && ['unique', 'key', 'index', 'constraint', 'references', 'check'].includes(w.v.toLowerCase())) {
-      throw sqlError(1235, 'indexes other than the primary key are not supported');
+    if (p.takeWord('primary')) { p.expectWord('key'); col.primary = true; col.nullable = false; continue; }
+    if (p.takeWord('not')) { p.expectWord('null'); col.nullable = false; continue; }
+    if (p.takeWord('null')) { if (!col.primary) col.nullable = true; continue; }
+    if (p.takeWord('default')) {
+      if (parseTimeFunc(p)) col.default = 'current_timestamp';
+      else if (p.takeWord('null')) col.default = null;
+      else col.default = parseLiteral(p);
+      continue;
     }
+    if (p.takeWord('on')) {
+      p.expectWord('update');
+      parseTimeFunc(p);
+      continue;
+    }
+    if (p.takeWord('comment')) { p.takeOp('='); parseLiteral(p); continue; }
+    if (p.takeWord('collate')) { parseIdent(p, true); continue; }
+    if (p.takeWord('character')) { p.expectWord('set'); parseIdent(p, true); continue; }
+    if (p.takeWord('charset')) { parseIdent(p, true); continue; }
+    if (p.takeWord('auto_increment')) { col.autoIncrement = true; col.nullable = false; continue; }
+    if (p.takeWord('unsigned')) { col.unsigned = true; continue; }
+    if (p.takeWord('zerofill')) continue;
+    if (p.takeWord('unique')) { col.unique = true; p.takeWord('key'); continue; }
+    if (p.takeWord('references')) { skipUntilComma(p); continue; }
+    if (p.takeWord('check')) { skipUntilComma(p); continue; }
+    const w = p.peek();
     throw sqlError(1064, `unexpected ${w ? w.v : 'end'} in a column`);
   }
 }
 
-function parseWhere(p) {
-  if (!p.takeWord('where')) return null;
-  const terms = [];
+function parseIndexCols(p) {
+  p.expectOp('(');
+  const columns = [];
   do {
-    const t = p.peek();
-    if (t && (t.t === 'num' || t.t === 'str')) {
-      const left = parseLiteral(p);
-      if (!p.peek() || p.peek().t !== 'op') {
-        terms.push({ constant: left });
-      } else {
-        const op = p.eat().v;
-        terms.push({ left, op, right: parseLiteral(p), constantCmp: true });
-      }
-    } else {
-      let col = parseIdent(p);
-      if (p.takeOp('.')) col = parseIdent(p);
-      if (p.takeWord('is')) {
-        const not = p.takeWord('not');
-        p.expectWord('null');
-        terms.push({ col, op: not ? 'is not' : 'is' });
-      } else {
-        const opTok = p.peek();
-        if (!opTok || opTok.t !== 'op' || !['=', '!=', '<>', '<', '>', '<=', '>='].includes(opTok.v)) {
-          throw sqlError(1064, 'expected a comparison');
-        }
-        p.eat();
-        terms.push({ col, op: opTok.v === '<>' ? '!=' : opTok.v, value: parseLiteral(p) });
-      }
+    columns.push(parseIdent(p));
+    p.takeWord('asc');
+    p.takeWord('desc');
+  } while (p.takeOp(','));
+  p.expectOp(')');
+  return columns;
+}
+
+function parseTableOptions(p) {
+  while (p.peek()) {
+    if (p.takeWord('engine') || p.takeWord('type')) { p.takeOp('='); parseIdent(p, true); continue; }
+    if (p.takeWord('default')) {
+      if (p.takeWord('character')) p.expectWord('set');
+      else if (!p.takeWord('charset') && !p.takeWord('collate')) throw sqlError(1064, 'expected a table option');
+      p.takeOp('=');
+      parseIdent(p, true);
+      continue;
     }
-    if (p.word('or')) throw sqlError(1235, 'OR is not supported');
-  } while (p.takeWord('and'));
-  return terms;
+    if (p.takeWord('character')) { p.expectWord('set'); p.takeOp('='); parseIdent(p, true); continue; }
+    if (p.takeWord('charset') || p.takeWord('collate')) { p.takeOp('='); parseIdent(p, true); continue; }
+    if (p.takeWord('comment')) { p.takeOp('='); parseLiteral(p); continue; }
+    if (p.takeWord('auto_increment') || p.takeWord('avg_row_length') || p.takeWord('key_block_size') || p.takeWord('max_rows') || p.takeWord('min_rows')) {
+      p.takeOp('=');
+      if (p.peek() && (p.peek().t === 'num' || p.peek().t === 'str')) p.eat();
+      continue;
+    }
+    if (p.takeWord('row_format') || p.takeWord('pack_keys') || p.takeWord('stats_persistent') || p.takeWord('compression')) {
+      p.takeOp('=');
+      if (p.peek()) p.eat();
+      continue;
+    }
+    throw sqlError(1064, `unexpected ${p.peek().v}`);
+  }
+}
+
+function takeAlias(p) {
+  if (p.takeWord('as')) return parseIdent(p, true);
+  const t = p.peek();
+  if (!t) return null;
+  if (t.t === 'id') return parseIdent(p, true);
+  if (t.t === 'word' && !RESERVED.has(t.v.toLowerCase())) return parseIdent(p);
+  return null;
+}
+
+function parseTableRef(p) {
+  const q = parseQualified(p);
+  const alias = takeAlias(p) || q.name;
+  return { schema: q.schema, name: q.name, alias };
+}
+
+function parseSelectList(p) {
+  const cols = [];
+  do {
+    let expr;
+    if (p.takeOp('*')) expr = { star: true };
+    else expr = parseExpr(p);
+    const as = takeAlias(p);
+    if (as) expr = { ...expr, as };
+    cols.push(expr);
+  } while (p.takeOp(','));
+  return cols;
 }
 
 function parseOrderLimit(p) {
   let order = null;
   if (p.takeWord('order')) {
     p.expectWord('by');
-    let col = parseIdent(p);
-    if (p.takeOp('.')) col = parseIdent(p);
-    const desc = p.takeWord('desc');
-    if (!desc) p.takeWord('asc');
-    order = { col, desc };
+    order = [];
+    do {
+      const expr = parseExpr(p);
+      const desc = p.takeWord('desc');
+      if (!desc) p.takeWord('asc');
+      order.push({ expr, desc });
+    } while (p.takeOp(','));
   }
   let limit = null;
-  let offset = 0;
+  let offset = { lit: 0 };
   if (p.takeWord('limit')) {
-    const a = p.peek();
-    if (!a || a.t !== 'num' || a.v < 0) throw sqlError(1064, 'bad LIMIT');
-    p.eat();
+    const a = parseLimitNum(p);
     if (p.takeOp(',')) {
-      const b = p.peek();
-      if (!b || b.t !== 'num' || b.v < 0) throw sqlError(1064, 'bad LIMIT');
-      p.eat();
-      offset = a.v;
-      limit = b.v;
+      offset = a;
+      limit = parseLimitNum(p);
     } else {
-      limit = a.v;
-      if (p.takeWord('offset')) {
-        const o = p.peek();
-        if (!o || o.t !== 'num' || o.v < 0) throw sqlError(1064, 'bad OFFSET');
-        p.eat();
-        offset = o.v;
-      }
+      limit = a;
+      if (p.takeWord('offset')) offset = parseLimitNum(p);
     }
   }
   return { order, limit, offset };
 }
 
-function parseSelectList(p) {
-  const cols = [];
-  do {
-    if (p.takeOp('*')) cols.push({ star: true });
-    else if (p.peek() && p.peek().t === 'sys') cols.push({ sys: p.eat().v });
-    else if (p.peek() && (p.peek().t === 'str' || p.peek().t === 'num' || (p.peek().t === 'word' && ['null', 'true', 'false'].includes(p.peek().v.toLowerCase())))) {
-      cols.push({ literal: parseLiteral(p) });
-    } else if (p.peek() && p.peek().t === 'word' && p.tokens[p.i + 1] && p.tokens[p.i + 1].t === 'op' && p.tokens[p.i + 1].v === '(') {
-      const name = foldName(p.eat().v);
-      p.expectOp('(');
-      if (!p.takeOp(')')) {
-        do { parseLiteral(p); } while (p.takeOp(','));
-        p.expectOp(')');
-      }
-      cols.push({ fn: name });
-    } else {
-      const name = parseIdent(p);
-      if (p.takeOp('(')) {
-        if (!p.takeOp(')')) {
-          do { parseLiteral(p); } while (p.takeOp(','));
-          p.expectOp(')');
-        }
-        cols.push({ fn: name });
-      } else if (p.takeOp('.')) {
-        if (p.takeOp('*')) cols.push({ star: true });
-        else cols.push({ col: parseIdent(p) });
-      } else cols.push({ col: name });
-    }
-    if (p.takeWord('as')) cols[cols.length - 1].as = parseIdent(p);
-    else if (p.peek() && p.peek().t === 'word' && !RESERVED.has(p.peek().v.toLowerCase())) {
-      cols[cols.length - 1].as = parseIdent(p);
-    }
-  } while (p.takeOp(','));
-  return cols;
+function parseLimitNum(p) {
+  if (p.takeOp('?')) return { param: true };
+  const a = p.peek();
+  if (!a || a.t !== 'num' || a.v < 0) throw sqlError(1064, 'bad LIMIT');
+  p.eat();
+  return { lit: a.v };
 }
 
 function parseStatement(tokens) {
@@ -404,6 +581,13 @@ function parseStatement(tokens) {
       p.done();
       return { kind: 'show-charset' };
     }
+    if (p.takeWord('index') || p.takeWord('indexes') || p.takeWord('keys')) {
+      p.expectWord('from');
+      const name = parseQualified(p);
+      if (p.takeWord('from') || p.takeWord('in')) name.schema = parseIdent(p);
+      p.done();
+      return { kind: 'show-index', ...name };
+    }
     if (p.takeWord('tables')) {
       let schema = null;
       if (p.takeWord('from') || p.takeWord('in')) schema = parseIdent(p);
@@ -432,7 +616,7 @@ function parseStatement(tokens) {
       p.done();
       return { kind: which === 'status' ? 'show-status' : 'show-variables', like };
     }
-    if (p.takeWord('warnings')) { p.done(); return { kind: 'show-warnings' }; }
+    if (p.takeWord('warnings') || p.takeWord('errors')) { p.done(); return { kind: 'show-warnings' }; }
     throw sqlError(1064, 'unsupported SHOW');
   }
 
@@ -449,8 +633,20 @@ function parseStatement(tokens) {
       let ifNotExists = false;
       if (p.takeWord('if')) { p.expectWord('not'); p.expectWord('exists'); ifNotExists = true; }
       const name = parseIdent(p);
+      while (p.peek()) {
+        if (p.takeWord('default') || p.takeWord('character') || p.takeWord('charset') || p.takeWord('collate')) {
+          p.takeWord('character'); p.takeWord('set'); p.takeWord('charset'); p.takeWord('collate');
+          p.takeOp('=');
+          if (p.peek()) p.eat();
+          continue;
+        }
+        break;
+      }
       p.done();
       return { kind: 'create-database', name, ifNotExists };
+    }
+    if (p.word('view') || p.word('procedure') || p.word('function') || p.word('trigger') || p.word('index')) {
+      throw sqlError(1235, `CREATE ${p.peek().v} is not supported`);
     }
     p.expectWord('table');
     let ifNotExists = false;
@@ -458,23 +654,39 @@ function parseStatement(tokens) {
     const name = parseIdent(p);
     p.expectOp('(');
     const columns = [];
+    const indexes = [];
     let tablePk = null;
-    while (!p.takeOp(')')) {
+    while (p.peek() && !p.op(')')) {
+      if (p.takeWord('constraint')) {
+        if (!p.word('primary') && !p.word('unique') && !p.word('foreign') && !p.word('check') && !p.op('(')) parseIdent(p);
+      }
       if (p.word('primary')) {
         p.expectWord('primary');
         p.expectWord('key');
-        p.expectOp('(');
-        tablePk = parseIdent(p);
-        p.expectOp(')');
+        const cols = parseIndexCols(p);
+        if (cols.length !== 1) throw sqlError(1235, 'a composite primary key is not supported');
+        tablePk = cols[0];
+      } else if (p.takeWord('unique')) {
+        indexes.push(namedIndex(p, true));
+      } else if (p.word('key') || p.word('index')) {
+        indexes.push(namedIndex(p, false));
+      } else if (p.takeWord('foreign') || p.takeWord('check')) {
+        skipUntilComma(p);
       } else {
-        const col = { name: parseIdent(p), type: parseType(p), primary: false };
+        const colName = parseIdent(p);
+        const typed = parseType(p);
+        const col = {
+          name: colName, type: typed.type, mysqlType: typed.mysqlType, primary: false,
+          nullable: true, autoIncrement: false, default: null, unsigned: false, unique: false,
+        };
         parseColumnRest(p, col);
         columns.push(col);
       }
       if (!p.op(')')) p.expectOp(',');
     }
-    p.done();
-    return { kind: 'create-table', name, ifNotExists, columns, tablePk };
+    p.expectOp(')');
+    parseTableOptions(p);
+    return { kind: 'create-table', name, ifNotExists, columns, indexes, tablePk };
   }
 
   if (kind === 'drop') {
@@ -495,7 +707,8 @@ function parseStatement(tokens) {
   if (kind === 'insert' || kind === 'replace') {
     const replace = kind === 'replace';
     p.eat();
-    if (!replace) p.takeWord('ignore');
+    p.takeWord('low_priority') || p.takeWord('delayed') || p.takeWord('high_priority');
+    const ignore = !replace && p.takeWord('ignore');
     p.expectWord('into');
     const name = parseQualified(p);
     let cols = null;
@@ -509,27 +722,30 @@ function parseStatement(tokens) {
       do {
         const col = parseIdent(p);
         p.expectOp('=');
-        set.push({ col, value: parseLiteral(p) });
+        set.push({ col, expr: parseExpr(p) });
       } while (p.takeOp(','));
+      const onDup = parseOnDup(p);
       p.done();
-      return { kind: 'insert', replace, ...name, set };
+      return { kind: 'insert', replace, ignore, ...name, set, onDup };
     }
+    if (p.takeWord('select')) throw sqlError(1235, 'INSERT ... SELECT is not supported');
     p.expectWord('values');
     const tuples = [];
     do {
       p.expectOp('(');
       const vals = [];
-      if (!p.op(')')) do { vals.push(parseLiteral(p)); } while (p.takeOp(','));
+      if (!p.op(')')) do { vals.push(parseExpr(p)); } while (p.takeOp(','));
       p.expectOp(')');
       tuples.push(vals);
     } while (p.takeOp(','));
-    if (p.word('on')) throw sqlError(1235, 'ON DUPLICATE KEY UPDATE is not supported; use REPLACE');
+    const onDup = parseOnDup(p);
     p.done();
-    return { kind: 'insert', replace, ...name, cols, tuples };
+    return { kind: 'insert', replace, ignore, ...name, cols, tuples, onDup };
   }
 
   if (kind === 'update') {
     p.eat();
+    p.takeWord('low_priority');
     const name = parseQualified(p);
     p.expectWord('set');
     const set = [];
@@ -537,9 +753,9 @@ function parseStatement(tokens) {
       let col = parseIdent(p);
       if (p.takeOp('.')) col = parseIdent(p);
       p.expectOp('=');
-      set.push({ col, value: parseLiteral(p) });
+      set.push({ col, expr: parseExpr(p) });
     } while (p.takeOp(','));
-    const where = parseWhere(p);
+    const where = p.takeWord('where') ? parseExpr(p) : null;
     const { order, limit, offset } = parseOrderLimit(p);
     p.done();
     return { kind: 'update', ...name, set, where, order, limit, offset };
@@ -547,9 +763,10 @@ function parseStatement(tokens) {
 
   if (kind === 'delete') {
     p.eat();
+    p.takeWord('low_priority') || p.takeWord('quick') || p.takeWord('ignore');
     p.expectWord('from');
     const name = parseQualified(p);
-    const where = parseWhere(p);
+    const where = p.takeWord('where') ? parseExpr(p) : null;
     const { order, limit, offset } = parseOrderLimit(p);
     p.done();
     return { kind: 'delete', ...name, where, order, limit, offset };
@@ -557,24 +774,73 @@ function parseStatement(tokens) {
 
   if (kind === 'select') {
     p.eat();
+    const distinct = p.takeWord('distinct');
+    p.takeWord('all');
     const cols = parseSelectList(p);
     let from = null;
-    if (p.takeWord('from')) from = parseQualified(p);
-    if (p.word('join') || p.word('left') || p.word('right') || p.word('inner') || p.word('cross') || p.word('straight_join')) {
-      throw sqlError(1235, 'JOIN is not supported');
+    const joins = [];
+    if (p.takeWord('from')) {
+      from = parseTableRef(p);
+      for (;;) {
+        let how = null;
+        if (p.takeOp(',')) how = 'cross';
+        else if (p.takeWord('cross')) { p.takeWord('join'); how = 'cross'; }
+        else if (p.takeWord('inner')) { p.expectWord('join'); how = 'inner'; }
+        else if (p.takeWord('join') || p.takeWord('straight_join')) how = 'inner';
+        else if (p.takeWord('left')) { p.takeWord('outer'); p.expectWord('join'); how = 'left'; }
+        else if (p.takeWord('right')) { p.takeWord('outer'); p.expectWord('join'); how = 'right'; }
+        else break;
+        const table = parseTableRef(p);
+        let on = null;
+        if (how !== 'cross') {
+          p.expectWord('on');
+          on = parseExpr(p);
+        }
+        joins.push({ how, table, on });
+      }
     }
-    const where = parseWhere(p);
-    if (p.word('group')) throw sqlError(1235, 'GROUP BY is not supported');
+    const where = p.takeWord('where') ? parseExpr(p) : null;
+    let group = null;
+    if (p.takeWord('group')) {
+      p.expectWord('by');
+      group = [];
+      do { group.push(parseExpr(p)); } while (p.takeOp(','));
+    }
+    if (p.word('having')) throw sqlError(1235, 'HAVING is not supported');
+    if (p.word('union')) throw sqlError(1235, 'UNION is not supported');
     const { order, limit, offset } = parseOrderLimit(p);
     p.done();
-    return { kind: 'select', cols, from, where, order, limit, offset };
+    return { kind: 'select', cols, from, joins, where, group, distinct, order, limit, offset };
   }
 
   throw sqlError(1064, `unsupported statement ${first.v}`);
 }
 
-function ok(affectedRows = 0) {
-  return { kind: 'ok', affectedRows, insertId: 0 };
+function namedIndex(p, unique) {
+  p.takeWord('key') || p.takeWord('index');
+  let name = null;
+  if (!p.op('(')) name = parseIdent(p);
+  const columns = parseIndexCols(p);
+  return { name: name || `${unique ? 'uq' : 'ix'}_${columns.join('_')}`, unique, columns };
+}
+
+function parseOnDup(p) {
+  if (!p.takeWord('on')) return null;
+  p.expectWord('duplicate');
+  p.expectWord('key');
+  p.expectWord('update');
+  const updates = [];
+  do {
+    let col = parseIdent(p);
+    if (p.takeOp('.')) col = parseIdent(p);
+    p.expectOp('=');
+    updates.push({ col, expr: parseExpr(p) });
+  } while (p.takeOp(','));
+  return updates;
+}
+
+function ok(affectedRows = 0, insertId = 0) {
+  return { kind: 'ok', affectedRows, insertId: insertId || 0 };
 }
 function result(columns, rows) {
   return { kind: 'rows', columns, rows };
@@ -589,6 +855,8 @@ function mapStoreError(e) {
   if (e.code === 'exists') return sqlError(1050, e.message, '42S01');
   if (e.code === 'not_found') return sqlError(1146, e.message, '42S02');
   if (e.code === 'bad_row' && /too large/.test(e.message)) return sqlError(1406, e.message, '22001');
+  if (e.code === 'bad_row') return sqlError(1366, e.message, '22000');
+  if (e.code === 'bad_schema' || e.code === 'bad_name') return sqlError(1064, e.message, '42000');
   if (e.code === 'quota') return sqlError(1114, e.message, 'HY000');
   return sqlError(1105, e.message, 'HY000');
 }
@@ -619,6 +887,10 @@ function dirty(session) {
   return false;
 }
 
+function needsMeta(table) {
+  return table.columns.some((c) => c.autoIncrement) || (table.indexes || []).some((ix) => ix.unique);
+}
+
 async function commitSession(dataStore, session) {
   const overlay = session.overlay;
   session.overlay = null;
@@ -626,10 +898,20 @@ async function commitSession(dataStore, session) {
   if (!overlay || ![...overlay.values()].some((m) => m.size)) return ok();
   const db = requireDb(session);
   await storeCall(() => dataStore.transact(session.ownerId, db, async (tx) => {
-    for (const [table, rows] of overlay) {
+    for (const [tableName, rows] of overlay) {
+      const table = await dataStore.getTable(session.ownerId, db, tableName);
+      if (!table) throw sqlError(1146, `table ${tableName} does not exist`, '42S02');
+      if (needsMeta(table)) await tx.lockMeta(tableName);
+      const existing = await tx.listAll(tableName);
+      const merged = new Map(existing.map((r) => [r.pk, r]));
       for (const [pk, row] of rows) {
-        if (row == null) await tx.deleteRow(table, pk);
-        else await tx.putRow(table, pk, row.values);
+        if (row == null) merged.delete(pk);
+        else merged.set(pk, row);
+      }
+      assertUnique(table, [...merged.values()]);
+      for (const [pk, row] of rows) {
+        if (row == null) await tx.deleteRow(tableName, pk);
+        else await tx.putRow(tableName, pk, row.values, { maxBytes: SQL_MAX_BYTES });
       }
     }
   }));
@@ -640,10 +922,6 @@ function rollbackSession(session) {
   session.overlay = null;
   session.explicitTx = false;
   return ok();
-}
-
-function inTx(session) {
-  return !!session.overlay;
 }
 
 function ensureTx(session) {
@@ -666,11 +944,15 @@ async function loadSchema(dataStore, session, name) {
   return table;
 }
 
-async function readRow(dataStore, session, table, pk) {
-  if (session.overlay && session.overlay.has(table) && session.overlay.get(table).has(pk)) {
-    return session.overlay.get(table).get(pk);
+function comparePk(columns, a, b) {
+  const pk = columns.find((c) => c.primary);
+  if (pk && (pk.type === 'int' || pk.type === 'float' || pk.type === 'bool')) {
+    const av = Number(a.values[pk.name]);
+    const bv = Number(b.values[pk.name]);
+    if (av === bv) return 0;
+    return av < bv ? -1 : 1;
   }
-  return storeCall(() => dataStore.getRow(session.ownerId, session.database, table, pk));
+  return cmpPk(String(a.pk), String(b.pk));
 }
 
 async function scanTable(dataStore, session, table) {
@@ -683,15 +965,15 @@ async function scanTable(dataStore, session, table) {
       else map.set(pk, row);
     }
   }
-  return [...map.values()].sort((a, b) => cmpPk(a.pk, b.pk));
+  const schema = await loadSchema(dataStore, session, table);
+  return [...map.values()].sort((a, b) => comparePk(schema.columns, a, b));
 }
 
 function coerce(column, value) {
   if (value == null) return null;
   if (column.type === 'string') {
-    if (typeof value === 'string') return value;
-    if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-    throw sqlError(1366, `${column.name} must be a string`, '22000');
+    if (typeof value === 'object') throw sqlError(1366, `${column.name} must be a string`, '22000');
+    return String(value);
   }
   if (column.type === 'int') {
     const n = typeof value === 'number' ? value : (typeof value === 'boolean' ? (value ? 1 : 0) : (/^-?\d+$/.test(String(value)) ? Number(value) : NaN));
@@ -703,50 +985,124 @@ function coerce(column, value) {
     if (value === false || value === 0 || value === '0' || value === 'false') return false;
     throw sqlError(1366, `${column.name} must be true or false`, '22000');
   }
+  if (column.type === 'float') {
+    const n = typeof value === 'number' ? value : Number(value);
+    if (!Number.isFinite(n)) throw sqlError(1366, `${column.name} must be a number`, '22000');
+    return n;
+  }
+  if (column.type === 'decimal') {
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    if (typeof value === 'string' && /^-?\d+(\.\d+)?$/.test(value)) return value;
+    throw sqlError(1366, `${column.name} must be a decimal`, '22000');
+  }
+  if (column.type === 'datetime') {
+    if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().slice(0, 19).replace('T', ' ');
+    if (typeof value === 'string' && value.length > 0 && value.length < 64) return value;
+    throw sqlError(1366, `${column.name} must be a date or time`, '22000');
+  }
+  if (column.type === 'blob') {
+    if (Buffer.isBuffer(value)) return value.toString('base64');
+    if (typeof value === 'string') return value;
+    throw sqlError(1366, `${column.name} must be bytes`, '22000');
+  }
   if (typeof value === 'string') {
     try { return JSON.parse(value); } catch { throw sqlError(1366, `${column.name} must be JSON`, '22000'); }
   }
-  if (typeof value === 'number' || typeof value === 'boolean') return value;
-  throw sqlError(1366, `${column.name} must be JSON`, '22000');
-}
-
-function valuesFrom(columns, cols, vals) {
-  const names = cols || columns.map((c) => c.name);
-  if (names.length !== vals.length) throw sqlError(1136, 'column count does not match value count', '21S01');
-  const out = {};
-  for (const c of columns) out[c.name] = null;
-  for (let i = 0; i < names.length; i++) {
-    const column = columns.find((c) => c.name === names[i]);
-    if (!column) throw sqlError(1054, `unknown column ${names[i]}`, '42S22');
-    out[column.name] = coerce(column, vals[i]);
+  if (typeof value === 'number' || typeof value === 'boolean' || (value && typeof value === 'object')) {
+    try { return JSON.parse(JSON.stringify(value)); } catch { throw sqlError(1366, `${column.name} must be JSON`, '22000'); }
   }
-  return out;
+  throw sqlError(1366, `${column.name} must be JSON`, '22000');
 }
 
 function primaryOf(columns) {
   return columns.find((c) => c.primary);
 }
 
-async function writeRow(dataStore, session, table, values, { replace }) {
+function rowKey(col, logical) {
+  if (logical == null) return '';
+  if (col && col.type === 'bool') return (logical === true || logical === 1 || logical === '1') ? '1' : '0';
+  return String(logical);
+}
+
+function sameValue(a, b) {
+  if (a == null || b == null) return false;
+  if (typeof a === 'number' || typeof b === 'number') return Number(a) === Number(b);
+  if (typeof a === 'boolean' || typeof b === 'boolean') return (a === true || a === 1) === (b === true || b === 1);
+  return String(a) === String(b);
+}
+
+function findConflict(table, rows, values, selfPk) {
   const pkCol = primaryOf(table.columns);
-  const pk = values[pkCol.name];
-  if (typeof pk !== 'string' || pk.length === 0) throw sqlError(1364, `primary key ${pkCol.name} is required`, 'HY000');
-  const row = { pk, values: { ...values, [pkCol.name]: pk } };
-  if (inTx(session) || ensureTx(session)) {
-    const cur = await readRow(dataStore, session, table.name, pk);
-    if (cur && !replace) throw sqlError(1062, `duplicate primary key ${pk}`, '23000');
-    overlayTable(session, table.name).set(pk, row);
-    return;
+  const pk = rowKey(pkCol, values[pkCol.name]);
+  for (const r of rows) {
+    if (selfPk != null && r.pk === selfPk) continue;
+    if (r.pk === pk) return r;
   }
-  await storeCall(() => dataStore.transact(session.ownerId, session.database, async (tx) => {
-    if (replace) await tx.putRow(table.name, pk, row.values);
-    else await tx.insertRow(table.name, pk, row.values);
+  for (const ix of table.indexes || []) {
+    if (!ix.unique) continue;
+    if (ix.columns.some((c) => values[c] == null)) continue;
+    for (const r of rows) {
+      if (selfPk != null && r.pk === selfPk) continue;
+      if (ix.columns.every((c) => sameValue(r.values[c], values[c]))) return r;
+    }
+  }
+  return null;
+}
+
+function assertUnique(table, rows) {
+  const seenPk = new Set();
+  for (const r of rows) {
+    if (seenPk.has(r.pk)) throw sqlError(1062, `duplicate primary key ${r.pk}`, '23000');
+    seenPk.add(r.pk);
+  }
+  for (const ix of table.indexes || []) {
+    if (!ix.unique) continue;
+    const seen = new Set();
+    for (const r of rows) {
+      if (ix.columns.some((c) => r.values[c] == null)) continue;
+      const key = ix.columns.map((c) => String(r.values[c])).join('\0');
+      if (seen.has(key)) throw sqlError(1062, `duplicate key ${ix.name}`, '23000');
+      seen.add(key);
+    }
+  }
+}
+
+function nowStamp() {
+  return new Date().toISOString().slice(0, 19).replace('T', ' ');
+}
+
+async function allocAuto(dataStore, session, table) {
+  return storeCall(() => dataStore.transact(session.ownerId, session.database, async (tx) => {
+    const meta = await tx.lockMeta(table.name);
+    const id = Number(meta.ai || 1);
+    if (!Number.isSafeInteger(id)) throw sqlError(1114, 'auto-increment is exhausted', 'HY000');
+    await tx.setMeta(table.name, { ...meta, ai: id + 1 });
+    return id;
   }));
+}
+
+async function materialize(dataStore, session, table, raw) {
+  const values = {};
+  for (const c of table.columns) {
+    const present = Object.prototype.hasOwnProperty.call(raw, c.name);
+    let v = present ? raw[c.name] : undefined;
+    if (!present || v === undefined || (v === null && c.autoIncrement)) {
+      if (c.autoIncrement) v = await allocAuto(dataStore, session, table);
+      else if (c.default === 'current_timestamp') v = c.type === 'datetime' && String(c.mysqlType || '').startsWith('date') ? nowStamp().slice(0, 10) : nowStamp();
+      else if (c.default != null) v = coerce(c, c.default);
+      else if (c.nullable === false) throw sqlError(1364, `field ${c.name} has no default value`, 'HY000');
+      else v = null;
+    } else v = coerce(c, v);
+    values[c.name] = v;
+  }
+  const pkCol = primaryOf(table.columns);
+  if (values[pkCol.name] == null || values[pkCol.name] === '') throw sqlError(1364, `primary key ${pkCol.name} is required`, 'HY000');
+  return values;
 }
 
 function likeToRegExp(pattern) {
   let src = '^';
-  for (const ch of pattern) {
+  for (const ch of String(pattern)) {
     if (ch === '%') src += '.*';
     else if (ch === '_') src += '.';
     else src += ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -754,17 +1110,20 @@ function likeToRegExp(pattern) {
   return new RegExp(src + '$', 'i');
 }
 
-function cmpTyped(column, left, op, rawRight) {
-  let right;
-  try { right = coerce(column, rawRight); } catch { return op === '!='; }
+function truthy(v) {
+  return !(v == null || v === false || v === 0 || v === '');
+}
+
+function cmpValues(left, right, op) {
   if (left == null || right == null) return false;
   let n = 0;
-  if (column.type === 'int' || column.type === 'bool') {
-    const a = left === true ? 1 : left === false ? 0 : left;
-    const b = right === true ? 1 : right === false ? 0 : right;
-    n = a === b ? 0 : a < b ? -1 : 1;
-  } else if (column.type === 'string') n = cmpPk(String(left), String(right));
-  else n = cmpPk(JSON.stringify(left), JSON.stringify(right));
+  const numeric = typeof left === 'number' || typeof right === 'number' || typeof left === 'boolean' || typeof right === 'boolean';
+  if (numeric) {
+    const a = left === true ? 1 : left === false ? 0 : Number(left);
+    const b = right === true ? 1 : right === false ? 0 : Number(right);
+    if (!Number.isFinite(a) || !Number.isFinite(b)) n = cmpPk(String(left), String(right));
+    else n = a === b ? 0 : a < b ? -1 : 1;
+  } else n = cmpPk(String(left), String(right));
   if (op === '=') return n === 0;
   if (op === '!=') return n !== 0;
   if (op === '<') return n < 0;
@@ -774,66 +1133,185 @@ function cmpTyped(column, left, op, rawRight) {
   return false;
 }
 
-function rowMatches(columns, row, where) {
-  if (!where) return true;
-  for (const term of where) {
-    if (Object.prototype.hasOwnProperty.call(term, 'constant')) {
-      if (term.constant === 0 || term.constant === false || term.constant == null) return false;
-      continue;
-    }
-    if (term.constantCmp) {
-      if (!cmpTyped({ name: '_', type: typeof term.left === 'number' ? 'int' : 'string' }, term.left, term.op, term.right)) return false;
-      continue;
-    }
-    const column = columns.find((c) => c.name.toLowerCase() === term.col.toLowerCase());
-    if (!column) throw sqlError(1054, `unknown column ${term.col}`, '42S22');
-    const value = row.values[column.name];
-    if (term.op === 'is') { if (value != null) return false; continue; }
-    if (term.op === 'is not') { if (value == null) return false; continue; }
-    if (!cmpTyped(column, value, term.op, term.value)) return false;
+function findColumn(row, name, table) {
+  const want = String(name).toLowerCase();
+  if (table) {
+    const key = Object.keys(row.parts).find((k) => k.toLowerCase() === String(table).toLowerCase());
+    const part = key ? row.parts[key] : null;
+    if (!part) throw sqlError(1054, `unknown column ${table}.${name}`, '42S22');
+    const column = part.columns.find((c) => c.name.toLowerCase() === want);
+    if (!column) throw sqlError(1054, `unknown column ${table}.${name}`, '42S22');
+    return { column, value: part.values ? part.values[column.name] : null };
   }
-  return true;
-}
-
-function sortRows(columns, rows, order) {
-  if (!order) return rows;
-  const column = columns.find((c) => c.name.toLowerCase() === order.col.toLowerCase());
-  if (!column) throw sqlError(1054, `unknown column ${order.col}`, '42S22');
-  const signed = order.desc ? -1 : 1;
-  return [...rows].sort((a, b) => signed * (cmpTyped(column, a.values[column.name], '<', b.values[column.name]) ? -1 : cmpTyped(column, a.values[column.name], '>', b.values[column.name]) ? 1 : 0));
-}
-
-function sliceLimit(rows, limit, offset) {
-  const start = offset || 0;
-  if (limit == null) return rows.slice(start);
-  return rows.slice(start, start + limit);
-}
-
-function project(columns, rows, selectCols) {
-  if (!selectCols || selectCols.some((c) => c.star)) {
-    return { columns, rows: rows.map((r) => columns.map((c) => cell(c, r.values[c.name]))) };
+  const hits = [];
+  for (const part of Object.values(row.parts)) {
+    const column = part.columns.find((c) => c.name.toLowerCase() === want);
+    if (column) hits.push({ column, value: part.values ? part.values[column.name] : null });
   }
-  const outCols = selectCols.map((spec, i) => {
-    if (spec.literal !== undefined) return col(spec.as || `_${i}`, typeof spec.literal === 'number' ? 'int' : 'string');
-    if (spec.fn || spec.sys) return col(spec.as || (spec.fn || spec.sys), 'string');
-    const column = columns.find((c) => c.name.toLowerCase() === spec.col.toLowerCase());
-    if (!column) throw sqlError(1054, `unknown column ${spec.col}`, '42S22');
-    return { ...column, name: spec.as || column.name };
-  });
-  const outRows = rows.map((r) => selectCols.map((spec) => {
-    if (spec.literal !== undefined) return spec.literal;
-    if (spec.fn || spec.sys) return null;
-    const column = columns.find((c) => c.name.toLowerCase() === spec.col.toLowerCase());
-    return cell(column, r.values[column.name]);
-  }));
-  return { columns: outCols, rows: outRows };
+  if (!hits.length) throw sqlError(1054, `unknown column ${name}`, '42S22');
+  if (hits.length > 1) throw sqlError(1052, `column ${name} is ambiguous`, '23000');
+  return hits[0];
 }
 
-function cell(column, value) {
-  if (value == null) return null;
-  if (column.type === 'bool') return value ? 1 : 0;
-  if (column.type === 'json') return JSON.stringify(value);
-  return value;
+function evalFn(expr, ctx) {
+  const n = expr.fn;
+  const arg = (i) => evalExpr(expr.args[i], ctx);
+  if (AGG.has(n)) {
+    if (!ctx.group) throw sqlError(1111, 'invalid use of group function', 'HY000');
+    return evalAgg(expr, ctx.group, ctx);
+  }
+  if (n === 'database' || n === 'schema') return ctx.session.database;
+  if (n === 'user' || n === 'current_user' || n === 'session_user') return `${ctx.session.username}@%`;
+  if (n === 'version') return SERVER_VERSION;
+  if (n === 'connection_id') return ctx.session.connectionId || 0;
+  if (n === 'now' || n === 'current_timestamp' || n === 'utc_timestamp' || n === 'localtime' || n === 'localtimestamp') return nowStamp();
+  if (n === 'curdate' || n === 'current_date') return nowStamp().slice(0, 10);
+  if (n === 'ifnull' || n === 'nullif') {
+    const a = arg(0);
+    const b = arg(1);
+    if (n === 'nullif') return cmpValues(a, b, '=') ? null : a;
+    return a == null ? b : a;
+  }
+  if (n === 'coalesce') {
+    for (const a of expr.args) {
+      const v = evalExpr(a, ctx);
+      if (v != null) return v;
+    }
+    return null;
+  }
+  if (n === 'concat' || n === 'concat_ws') {
+    const skip = n === 'concat_ws' ? 1 : 0;
+    const sep = n === 'concat_ws' ? (arg(0) == null ? '' : String(arg(0))) : '';
+    const parts = [];
+    for (let i = skip; i < expr.args.length; i++) {
+      const v = evalExpr(expr.args[i], ctx);
+      if (v == null) {
+        if (n === 'concat') return null;
+        continue;
+      }
+      parts.push(String(v));
+    }
+    return n === 'concat_ws' ? parts.join(sep) : parts.join('');
+  }
+  if (n === 'lower' || n === 'lcase') { const v = arg(0); return v == null ? null : String(v).toLowerCase(); }
+  if (n === 'upper' || n === 'ucase') { const v = arg(0); return v == null ? null : String(v).toUpperCase(); }
+  if (n === 'length' || n === 'char_length' || n === 'character_length') {
+    const v = arg(0);
+    return v == null ? null : String(v).length;
+  }
+  if (n === 'if') return truthy(arg(0)) ? arg(1) : arg(2);
+  if (n === 'values') {
+    const name = expr.args[0] && expr.args[0].col;
+    if (!name || !ctx.insertValues) throw sqlError(1064, 'VALUES() is only valid in ON DUPLICATE KEY UPDATE');
+    const key = Object.keys(ctx.insertValues).find((k) => k.toLowerCase() === name.toLowerCase());
+    return key ? ctx.insertValues[key] : null;
+  }
+  throw sqlError(1235, `function ${n} is not supported`);
+}
+
+function evalAgg(expr, rows, ctx) {
+  if (expr.fn === 'count' && expr.star) return rows.length;
+  const vals = [];
+  for (const row of rows) {
+    const v = evalExpr(expr.args[0], { ...ctx, row, group: null });
+    if (v != null) vals.push(v);
+  }
+  if (expr.fn === 'count') return vals.length;
+  if (!vals.length) return null;
+  if (expr.fn === 'sum') return vals.reduce((a, b) => a + Number(b), 0);
+  if (expr.fn === 'avg') return vals.reduce((a, b) => a + Number(b), 0) / vals.length;
+  let best = vals[0];
+  for (const v of vals.slice(1)) {
+    const less = cmpValues(v, best, '<');
+    if (expr.fn === 'min' ? less : cmpValues(v, best, '>')) best = v;
+  }
+  return best;
+}
+
+function evalExpr(expr, ctx) {
+  if (expr == null) return null;
+  if (Object.prototype.hasOwnProperty.call(expr, 'lit')) return expr.lit;
+  if (expr.param) throw sqlError(1064, 'not enough parameters');
+  if (expr.def) return undefined;
+  if (expr.sys) return sysValue(ctx.session, expr.sys);
+  if (expr.col) {
+    if (!ctx.row) return null;
+    return findColumn(ctx.row, expr.col, expr.table).value;
+  }
+  if (expr.fn) return evalFn(expr, ctx);
+  if (expr.op === 'neg') {
+    const v = evalExpr(expr.args[0], ctx);
+    return v == null ? null : -Number(v);
+  }
+  if (expr.op === '+' || expr.op === '-' || expr.op === '*' || expr.op === '/') {
+    const a = evalExpr(expr.args[0], ctx);
+    const b = evalExpr(expr.args[1], ctx);
+    if (a == null || b == null) return null;
+    const x = Number(a);
+    const y = Number(b);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    if (expr.op === '+') return x + y;
+    if (expr.op === '-') return x - y;
+    if (expr.op === '*') return x * y;
+    return y === 0 ? null : x / y;
+  }
+  if (expr.op === 'and') return truthy(evalExpr(expr.args[0], ctx)) && truthy(evalExpr(expr.args[1], ctx));
+  if (expr.op === 'or') return truthy(evalExpr(expr.args[0], ctx)) || truthy(evalExpr(expr.args[1], ctx));
+  if (expr.op === 'not') return !truthy(evalExpr(expr.args[0], ctx));
+  if (expr.op === 'is') {
+    const v = evalExpr(expr.args[0], ctx);
+    return expr.not ? v != null : v == null;
+  }
+  if (expr.op === 'like') {
+    const left = evalExpr(expr.args[0], ctx);
+    const right = evalExpr(expr.args[1], ctx);
+    if (left == null || right == null) return false;
+    return likeToRegExp(right).test(String(left));
+  }
+  if (expr.op === 'in') {
+    const left = evalExpr(expr.args[0], ctx);
+    if (left == null) return false;
+    return expr.args.slice(1).some((a) => cmpValues(left, evalExpr(a, ctx), '='));
+  }
+  if (expr.op === 'between') {
+    const v = evalExpr(expr.args[0], ctx);
+    return cmpValues(v, evalExpr(expr.args[1], ctx), '>=') && cmpValues(v, evalExpr(expr.args[2], ctx), '<=');
+  }
+  if (expr.op === 'cmp') return cmpValues(evalExpr(expr.args[0], ctx), evalExpr(expr.args[1], ctx), expr.cmp);
+  throw sqlError(1064, 'bad expression');
+}
+
+function bindParams(expr, session) {
+  if (!expr || typeof expr !== 'object') return expr;
+  if (expr.param) {
+    if (!session.params || session._paramI >= session.params.length) throw sqlError(1064, 'not enough parameters');
+    return { lit: session.params[session._paramI++], as: expr.as };
+  }
+  const out = { ...expr };
+  if (expr.args) out.args = expr.args.map((a) => bindParams(a, session));
+  return out;
+}
+
+function bindNum(expr, session) {
+  if (!expr) return null;
+  const bound = bindParams(expr, session);
+  return bound.lit;
+}
+
+function bindStmt(stmt, session) {
+  session._paramI = 0;
+  const out = { ...stmt };
+  if (stmt.cols) out.cols = stmt.cols.map((c) => bindParams(c, session));
+  if (stmt.where) out.where = bindParams(stmt.where, session);
+  if (stmt.group) out.group = stmt.group.map((g) => bindParams(g, session));
+  if (stmt.order) out.order = stmt.order.map((o) => ({ ...o, expr: bindParams(o.expr, session) }));
+  if (stmt.limit) out.limit = bindNum(stmt.limit, session);
+  if (stmt.offset) out.offset = bindNum(stmt.offset, session);
+  if (stmt.joins) out.joins = stmt.joins.map((j) => ({ ...j, on: j.on ? bindParams(j.on, session) : null }));
+  if (stmt.set) out.set = stmt.set.map((s) => ({ ...s, expr: s.expr ? bindParams(s.expr, session) : s.expr }));
+  if (stmt.tuples) out.tuples = stmt.tuples.map((t) => t.map((e) => bindParams(e, session)));
+  if (stmt.onDup) out.onDup = stmt.onDup.map((s) => ({ ...s, expr: bindParams(s.expr, session) }));
+  return out;
 }
 
 function variables(session) {
@@ -864,13 +1342,21 @@ function sysValue(session, name) {
   return hit ? hit[1] : null;
 }
 
-function fnValue(session, name) {
-  const n = name.toLowerCase();
-  if (n === 'database' || n === 'schema') return session.database;
-  if (n === 'user' || n === 'current_user' || n === 'session_user') return `${session.username}@%`;
-  if (n === 'version') return SERVER_VERSION;
-  if (n === 'connection_id') return session.connectionId || 0;
-  throw sqlError(1235, `function ${name} is not supported`);
+function columnTypeSql(c) {
+  if (typeof c.mysqlType === 'string' && c.mysqlType !== c.type) return c.mysqlType;
+  if (c.type === 'string') return 'varchar(255)';
+  if (c.type === 'int') return 'bigint';
+  if (c.type === 'bool') return 'tinyint(1)';
+  if (c.type === 'float') return 'double';
+  if (c.type === 'decimal') return 'decimal(65,30)';
+  if (c.type === 'datetime') return 'datetime';
+  if (c.type === 'blob') return 'blob';
+  return 'json';
+}
+
+function dataTypeName(c) {
+  const sql = columnTypeSql(c);
+  return sql.replace(/\(.*$/, '');
 }
 
 async function infoRows(dataStore, session, tableName) {
@@ -890,118 +1376,383 @@ async function infoRows(dataStore, session, tableName) {
   if (name === 'tables') {
     return {
       columns: [col('TABLE_SCHEMA', 'string'), col('TABLE_NAME', 'string'), col('TABLE_TYPE', 'string'), col('ENGINE', 'string')],
-      records: owned.map((t) => ({ values: { TABLE_SCHEMA: t.db, TABLE_NAME: t.table.name, TABLE_TYPE: 'BASE TABLE', ENGINE: 'Funx' } })),
+      records: owned.map((t) => ({ values: { TABLE_SCHEMA: t.db, TABLE_NAME: t.table.name, TABLE_TYPE: 'BASE TABLE', ENGINE: 'InnoDB' } })),
     };
   }
   if (name === 'columns') {
     const records = [];
     for (const t of owned) {
+      const unique = new Set();
+      for (const ix of t.table.indexes || []) if (ix.unique) for (const c of ix.columns) unique.add(c);
       t.table.columns.forEach((c, i) => {
         records.push({ values: {
           TABLE_SCHEMA: t.db,
           TABLE_NAME: t.table.name,
           COLUMN_NAME: c.name,
           ORDINAL_POSITION: i + 1,
-          DATA_TYPE: c.type === 'bool' ? 'tinyint' : c.type === 'int' ? 'bigint' : c.type,
-          COLUMN_TYPE: c.type === 'string' ? 'varchar(255)' : c.type === 'int' ? 'bigint' : c.type === 'bool' ? 'tinyint(1)' : 'json',
-          COLUMN_KEY: c.primary ? 'PRI' : '',
-          IS_NULLABLE: c.primary ? 'NO' : 'YES',
+          DATA_TYPE: dataTypeName(c),
+          COLUMN_TYPE: columnTypeSql(c),
+          COLUMN_KEY: c.primary ? 'PRI' : (unique.has(c.name) ? 'UNI' : ''),
+          IS_NULLABLE: c.nullable === false || c.primary ? 'NO' : 'YES',
+          COLUMN_DEFAULT: c.default == null ? null : String(c.default),
+          EXTRA: c.autoIncrement ? 'auto_increment' : '',
         } });
       });
     }
     return {
-      columns: ['TABLE_SCHEMA', 'TABLE_NAME', 'COLUMN_NAME', 'ORDINAL_POSITION', 'DATA_TYPE', 'COLUMN_TYPE', 'COLUMN_KEY', 'IS_NULLABLE']
+      columns: ['TABLE_SCHEMA', 'TABLE_NAME', 'COLUMN_NAME', 'ORDINAL_POSITION', 'DATA_TYPE', 'COLUMN_TYPE', 'COLUMN_KEY', 'IS_NULLABLE', 'COLUMN_DEFAULT', 'EXTRA']
         .map((n) => col(n, n === 'ORDINAL_POSITION' ? 'int' : 'string')),
       records,
     };
   }
   if (name === 'statistics') {
-    return { columns: [col('TABLE_SCHEMA', 'string'), col('TABLE_NAME', 'string'), col('INDEX_NAME', 'string')], records: [] };
+    const records = [];
+    for (const t of owned) {
+      const pk = t.table.columns.find((c) => c.primary);
+      if (pk) {
+        records.push({ values: { TABLE_SCHEMA: t.db, TABLE_NAME: t.table.name, INDEX_NAME: 'PRIMARY', NON_UNIQUE: 0, SEQ_IN_INDEX: 1, COLUMN_NAME: pk.name } });
+      }
+      for (const ix of t.table.indexes || []) {
+        ix.columns.forEach((c, i) => {
+          records.push({ values: {
+            TABLE_SCHEMA: t.db, TABLE_NAME: t.table.name, INDEX_NAME: ix.name, NON_UNIQUE: ix.unique ? 0 : 1, SEQ_IN_INDEX: i + 1, COLUMN_NAME: c,
+          } });
+        });
+      }
+    }
+    return {
+      columns: ['TABLE_SCHEMA', 'TABLE_NAME', 'INDEX_NAME', 'NON_UNIQUE', 'SEQ_IN_INDEX', 'COLUMN_NAME']
+        .map((n) => col(n, n === 'NON_UNIQUE' || n === 'SEQ_IN_INDEX' ? 'int' : 'string')),
+      records,
+    };
   }
   throw sqlError(1146, `table information_schema.${tableName} does not exist`, '42S02');
 }
 
-function selectVirtual(columns, records, stmt) {
-  let rows = records.filter((r) => rowMatches(columns, r, stmt.where));
-  rows = sortRows(columns, rows, stmt.order);
-  rows = sliceLimit(rows, stmt.limit, stmt.offset);
-  if (!stmt.cols || stmt.cols.some((c) => c.star && !c.fn && !c.sys && c.literal === undefined && !c.col)) {
-    const projected = project(columns, rows, stmt.cols && stmt.cols.some((c) => c.star) ? null : stmt.cols);
-    return result(projected.columns, projected.rows);
-  }
-  const projected = project(columns, rows, stmt.cols.map((spec) => {
-    if (spec.fn) return { ...spec, literal: fnValue({ database: null, username: '' }, spec.fn) };
-    return spec;
+function wrapRows(alias, columns, rows) {
+  return rows.map((r) => ({
+    pk: r.pk,
+    values: r.values,
+    parts: { [alias]: { values: r.values, columns } },
   }));
-  return result(projected.columns, projected.rows);
+}
+
+function nullPart(columns) {
+  const values = {};
+  for (const c of columns) values[c.name] = null;
+  return { values, columns };
+}
+
+function joinAll(base, joins, ctx) {
+  let rows = base;
+  for (const join of joins) {
+    const next = [];
+    const rightRows = join.rows;
+    if (join.how === 'right') {
+      for (const rr of rightRows) {
+        let matched = false;
+        for (const left of rows) {
+          const merged = { parts: { ...left.parts, [join.alias]: { values: rr.values, columns: join.columns } } };
+          if (!join.on || truthy(evalExpr(join.on, { ...ctx, row: merged }))) {
+            matched = true;
+            next.push(merged);
+          }
+        }
+        if (!matched) {
+          const parts = {};
+          for (const [name, part] of Object.entries(rows[0] ? rows[0].parts : {})) parts[name] = nullPart(part.columns);
+          if (!rows[0] && join.leftColumns) {
+            for (const [name, columns] of Object.entries(join.leftColumns)) parts[name] = nullPart(columns);
+          }
+          parts[join.alias] = { values: rr.values, columns: join.columns };
+          next.push({ parts });
+        }
+      }
+    } else {
+      for (const left of rows) {
+        let matched = false;
+        for (const rr of rightRows) {
+          const merged = { parts: { ...left.parts, [join.alias]: { values: rr.values, columns: join.columns } } };
+          const ok = join.how === 'cross' || !join.on || truthy(evalExpr(join.on, { ...ctx, row: merged }));
+          if (ok) { matched = true; next.push(merged); }
+        }
+        if (!matched && join.how === 'left') {
+          next.push({ parts: { ...left.parts, [join.alias]: nullPart(join.columns) } });
+        }
+      }
+    }
+    rows = next;
+  }
+  return rows;
+}
+
+function exprName(expr, i, sample) {
+  if (expr.as) return expr.as;
+  if (expr.col && sample) {
+    try { return findColumn(sample, expr.col, expr.table).column.name; } catch { return expr.col; }
+  }
+  if (expr.col) return expr.col;
+  if (expr.fn) return `${expr.fn}()`;
+  if (expr.sys) return `@@${expr.sys}`;
+  if (expr.lit != null) return String(expr.lit);
+  return `_${i}`;
+}
+
+function exprType(expr, sample) {
+  if (expr.fn === 'count') return 'int';
+  if (expr.fn === 'sum') return 'int';
+  if (expr.fn === 'avg') return 'float';
+  if (expr.fn === 'now' || expr.fn === 'current_timestamp') return 'datetime';
+  if (expr.col && sample) {
+    try { return findColumn(sample, expr.col, expr.table).column.type; } catch { return 'string'; }
+  }
+  if (expr.fn === 'min' || expr.fn === 'max') return expr.args[0] ? exprType(expr.args[0], sample) : 'string';
+  if (Object.prototype.hasOwnProperty.call(expr, 'lit')) {
+    if (typeof expr.lit === 'number') return Number.isInteger(expr.lit) ? 'int' : 'float';
+    if (typeof expr.lit === 'boolean') return 'bool';
+  }
+  return 'string';
+}
+
+function wireValue(type, value) {
+  if (value == null) return null;
+  if (type === 'bool') return value ? 1 : 0;
+  if (type === 'json') return typeof value === 'string' ? value : JSON.stringify(value);
+  if (type === 'int' && typeof value === 'number') return value;
+  return value;
+}
+
+function hasAgg(expr) {
+  if (!expr || typeof expr !== 'object') return false;
+  if (expr.fn && AGG.has(expr.fn)) return true;
+  return (expr.args || []).some(hasAgg);
+}
+
+function expandStars(cols, sample) {
+  const out = [];
+  for (const spec of cols) {
+    if (!spec.star || spec.fn) { out.push(spec); continue; }
+    if (!sample) throw sqlError(1064, 'SELECT * needs a table');
+    const entries = spec.table
+      ? [[spec.table, sample.parts[spec.table]]].filter((e) => e[1])
+      : Object.entries(sample.parts);
+    if (spec.table && !sample.parts[spec.table]) throw sqlError(1054, `unknown table ${spec.table}`, '42S22');
+    for (const [, part] of entries) {
+      for (const c of part.columns) out.push({ col: c.name, table: Object.keys(sample.parts).find((k) => sample.parts[k] === part), as: null, _type: c.type });
+    }
+  }
+  return out;
+}
+
+function project(cols, rows, ctx, sampleRow) {
+  const sample = sampleRow || rows[0] || null;
+  const specs = expandStars(cols, sample);
+  if (specs.some((s) => s.star && !s.fn)) throw sqlError(1054, 'unknown column', '42S22');
+  const aggregated = specs.some(hasAgg) || ctx.groupBy;
+  let groups;
+  if (aggregated) {
+    const map = new Map();
+    const source = rows;
+    if (ctx.groupBy) {
+      for (const row of source) {
+        const key = JSON.stringify(ctx.groupBy.map((g) => evalExpr(g, { ...ctx, row })));
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push(row);
+      }
+    } else map.set('*', source);
+    groups = [...map.values()];
+    if (!ctx.groupBy && groups.length === 1 && groups[0].length === 0) groups = [[]];
+  } else groups = rows.map((r) => [r]);
+  const columns = specs.map((spec, i) => col(exprName(spec, i, (groups.find((g) => g[0]) || [])[0] || sample), spec._type || exprType(spec, (groups.find((g) => g[0]) || [])[0] || sample)));
+  const out = groups.map((group) => {
+    const row = group[0] || null;
+    return specs.map((spec, i) => wireValue(columns[i].type, evalExpr(spec, { ...ctx, row, group })));
+  });
+  return { columns, rows: out };
+}
+
+async function loadRef(dataStore, session, ref) {
+  const schema = ref.schema || session.database;
+  if (schema === 'information_schema') {
+    const info = await infoRows(dataStore, session, ref.name);
+    return { alias: ref.alias, columns: info.columns, rows: info.records.map((r) => ({ pk: '', values: r.values })) };
+  }
+  if (!schema) throw sqlError(1046, 'no database selected', '3D000');
+  if (VIRTUAL.has(schema)) throw sqlError(1044, `access denied for database ${schema}`, '42000');
+  const saved = session.database;
+  if (schema !== saved) {
+    const db = await storeCall(() => dataStore.getDatabase(session.ownerId, schema));
+    if (!db) throw sqlError(1049, `unknown database ${schema}`, '42000');
+    session.database = schema;
+  }
+  try {
+    const table = await loadSchema(dataStore, session, ref.name);
+    const rows = await scanTable(dataStore, session, table.name);
+    return { alias: ref.alias, table, columns: table.columns, rows };
+  } finally { session.database = saved; }
 }
 
 async function runSelect(dataStore, session, stmt) {
+  const ctx = { session, row: null, group: null, groupBy: stmt.group };
   if (!stmt.from) {
-    const columns = [];
-    const values = [];
-    for (const spec of stmt.cols) {
-      if (spec.star) throw sqlError(1064, 'SELECT * needs a table');
-      if (spec.fn) { columns.push(col(spec.as || `${spec.fn}()`, 'string')); values.push(fnValue(session, spec.fn)); }
-      else if (spec.sys) { columns.push(col(spec.as || `@@${spec.sys}`, 'string')); values.push(sysValue(session, spec.sys)); }
-      else if (spec.literal !== undefined) {
-        columns.push(col(spec.as || 'value', typeof spec.literal === 'number' ? 'int' : 'string'));
-        values.push(spec.literal);
-      } else throw sqlError(1054, `unknown column ${spec.col}`, '42S22');
+    if (stmt.cols.some((c) => c.star || c.col)) throw sqlError(1054, 'unknown column', '42S22');
+    const projected = project(stmt.cols, [{ parts: {} }], ctx);
+    return result(projected.columns, sliceRows(projected.rows, stmt));
+  }
+  const baseRef = await loadRef(dataStore, session, stmt.from);
+  let rows = wrapRows(baseRef.alias, baseRef.columns, baseRef.rows);
+  const joins = [];
+  const leftColumns = { [baseRef.alias]: baseRef.columns };
+  for (const join of stmt.joins || []) {
+    const ref = await loadRef(dataStore, session, join.table);
+    joins.push({ how: join.how, on: join.on, alias: ref.alias, columns: ref.columns, rows: ref.rows, leftColumns: { ...leftColumns } });
+    leftColumns[ref.alias] = ref.columns;
+  }
+  if (joins.length) rows = joinAll(rows, joins, ctx);
+  if (stmt.where) rows = rows.filter((row) => truthy(evalExpr(stmt.where, { ...ctx, row })));
+  const layout = rows[0] || {
+    parts: Object.fromEntries(Object.entries(leftColumns).map(([alias, columns]) => [alias, { columns, values: null }])),
+  };
+  if (!stmt.group && canSortSource(stmt.order, layout)) {
+    rows = [...rows].sort((a, b) => compareOrder(stmt.order, a, b, ctx));
+  }
+  const projected = project(stmt.cols, rows, ctx, layout);
+  let outRows = projected.rows;
+  if (stmt.distinct) {
+    const seen = new Set();
+    outRows = outRows.filter((r) => {
+      const key = JSON.stringify(r);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+  if (stmt.order && !(!stmt.group && canSortSource(stmt.order, layout))) {
+    outRows = [...outRows].sort((a, b) => {
+      for (const o of stmt.order) {
+        const av = orderValue(o, a, projected.columns, stmt.cols);
+        const bv = orderValue(o, b, projected.columns, stmt.cols);
+        if (cmpValues(av, bv, '<')) return o.desc ? 1 : -1;
+        if (cmpValues(av, bv, '>')) return o.desc ? -1 : 1;
+      }
+      return 0;
+    });
+  }
+  return result(projected.columns, sliceRows(outRows, stmt));
+}
+
+function sliceRows(rows, stmt) {
+  const start = stmt.offset || 0;
+  if (stmt.limit == null) return rows.slice(start);
+  return rows.slice(start, start + stmt.limit);
+}
+
+function canSortSource(order, sample) {
+  if (!order || !sample) return false;
+  return order.every((o) => {
+    if (!o.expr || !o.expr.col) return false;
+    try { findColumn(sample, o.expr.col, o.expr.table); return true; } catch { return false; }
+  });
+}
+
+function compareOrder(order, a, b, ctx) {
+  for (const o of order) {
+    const av = evalExpr(o.expr, { ...ctx, row: a, group: null });
+    const bv = evalExpr(o.expr, { ...ctx, row: b, group: null });
+    if (cmpValues(av, bv, '<')) return o.desc ? 1 : -1;
+    if (cmpValues(av, bv, '>')) return o.desc ? -1 : 1;
+  }
+  return 0;
+}
+
+function orderValue(order, row, columns, selectCols) {
+  const expr = order.expr;
+  if (expr && expr.col && !expr.table) {
+    const idx = columns.findIndex((c) => c.name.toLowerCase() === expr.col.toLowerCase());
+    if (idx >= 0) return row[idx];
+    const alias = (selectCols || []).find((c) => c.as && c.as.toLowerCase() === expr.col.toLowerCase());
+    if (alias) {
+      const i = columns.findIndex((c) => c.name.toLowerCase() === alias.as.toLowerCase());
+      if (i >= 0) return row[i];
     }
-    const rows = sliceLimit([{ values: {} }], stmt.limit, stmt.offset);
-    return result(columns, rows.length ? [values] : []);
   }
-  const schema = stmt.from.schema || session.database;
-  if (schema === 'information_schema') {
-    const info = await infoRows(dataStore, session, stmt.from.name);
-    let rows = info.records.filter((r) => rowMatches(info.columns, r, stmt.where));
-    rows = sortRows(info.columns, rows, stmt.order);
-    rows = sliceLimit(rows, stmt.limit, stmt.offset);
-    const projected = project(info.columns, rows, stmt.cols);
-    // Fill function/sys cells that project left null.
-    projected.rows = projected.rows.map((row) => row.map((value, i) => {
-      const spec = stmt.cols[i];
-      if (!spec || spec.star) return value;
-      if (spec.fn) return fnValue(session, spec.fn);
-      if (spec.sys) return sysValue(session, spec.sys);
-      return value;
-    }));
-    if (stmt.cols.some((c) => c.star)) return result(projected.columns, rows.map((r) => info.columns.map((c) => cell(c, r.values[c.name]))));
-    return result(projected.columns, projected.rows);
+  if (expr && Object.prototype.hasOwnProperty.call(expr, 'lit') && typeof expr.lit === 'number') {
+    const i = expr.lit - 1;
+    if (i >= 0 && i < row.length) return row[i];
   }
-  if (!schema) throw sqlError(1046, 'no database selected', '3D000');
-  if (schema !== session.database) {
-    const saved = session.database;
-    session.database = schema;
-    try { return await runSelect(dataStore, session, { ...stmt, from: { schema: null, name: stmt.from.name } }); }
-    finally { session.database = saved; }
+  return null;
+}
+
+async function readVisible(dataStore, session, table) {
+  return scanTable(dataStore, session, table.name);
+}
+
+async function applyWrites(dataStore, session, table, fn) {
+  if (ensureTx(session)) {
+    const rows = await readVisible(dataStore, session, table);
+    return fn({
+      rows,
+      async put(pk, values) { overlayTable(session, table.name).set(pk, { pk, values }); },
+      async del(pk) { overlayTable(session, table.name).set(pk, null); },
+    });
   }
-  const table = await loadSchema(dataStore, session, stmt.from.name);
-  let rows = (await scanTable(dataStore, session, table.name)).filter((r) => rowMatches(table.columns, r, stmt.where));
-  rows = sortRows(table.columns, rows, stmt.order);
-  rows = sliceLimit(rows, stmt.limit, stmt.offset);
-  if (stmt.cols.some((c) => c.star)) {
-    return result(table.columns, rows.map((r) => table.columns.map((c) => cell(c, r.values[c.name]))));
-  }
-  const projected = project(table.columns, rows, stmt.cols);
-  projected.rows = projected.rows.map((row) => row.map((value, i) => {
-    const spec = stmt.cols[i];
-    if (spec.fn) return fnValue(session, spec.fn);
-    if (spec.sys) return sysValue(session, spec.sys);
-    return value;
+  return storeCall(() => dataStore.transact(session.ownerId, session.database, async (tx) => {
+    if (needsMeta(table)) await tx.lockMeta(table.name);
+    const rows = await tx.listAll(table.name);
+    return fn({
+      rows,
+      async put(pk, values) { await tx.putRow(table.name, pk, values, { maxBytes: SQL_MAX_BYTES }); },
+      async del(pk) { await tx.deleteRow(table.name, pk); },
+    });
   }));
-  return result(projected.columns, projected.rows);
 }
 
-function columnTypeSql(c) {
-  if (c.type === 'string') return 'varchar(255)';
-  if (c.type === 'int') return 'bigint';
-  if (c.type === 'bool') return 'tinyint(1)';
-  return 'json';
+async function insertOne(dataStore, session, table, raw, stmt) {
+  const values = await materialize(dataStore, session, table, raw);
+  const pkCol = primaryOf(table.columns);
+  const pk = rowKey(pkCol, values[pkCol.name]);
+  const outcome = await applyWrites(dataStore, session, table, async (tx) => {
+    let conflicts = [];
+    let rest = tx.rows;
+    const seen = new Set();
+    for (;;) {
+      const hit = findConflict(table, rest, values, null);
+      if (!hit || seen.has(hit.pk)) break;
+      seen.add(hit.pk);
+      conflicts.push(hit);
+      rest = rest.filter((r) => r.pk !== hit.pk);
+    }
+    if (conflicts.length && stmt.ignore && !stmt.replace && !stmt.onDup) return { affected: 0, insertId: 0 };
+    if (conflicts.length && !stmt.replace && !stmt.onDup) throw sqlError(1062, 'duplicate entry', '23000');
+    if (stmt.onDup && conflicts.length) {
+      const hit = conflicts[0];
+      const updated = { ...hit.values };
+      const row = { parts: { [table.name]: { values: hit.values, columns: table.columns } }, values: hit.values };
+      for (const set of stmt.onDup) {
+        const column = table.columns.find((c) => c.name === set.col);
+        if (!column) throw sqlError(1054, `unknown column ${set.col}`, '42S22');
+        if (column.primary) throw sqlError(1235, 'changing the primary key is not supported');
+        const v = evalExpr(set.expr, { session, row, insertValues: values, group: null });
+        updated[column.name] = v === undefined ? updated[column.name] : coerce(column, v);
+      }
+      updated[pkCol.name] = hit.values[pkCol.name];
+      await tx.put(hit.pk, updated);
+      return { affected: 2, insertId: pkCol.type === 'int' ? Number(hit.values[pkCol.name]) : 0 };
+    }
+    for (const hit of conflicts) await tx.del(hit.pk);
+    await tx.put(pk, values);
+    return { affected: 1, insertId: pkCol.type === 'int' ? Number(values[pkCol.name]) : 0 };
+  });
+  return outcome;
 }
 
-async function run(dataStore, session, stmt) {
+function columnExtra(c) {
+  return c.autoIncrement ? 'auto_increment' : '';
+}
+
+async function run(dataStore, session, stmtIn) {
+  const stmt = (stmtIn.kind === 'select' || stmtIn.kind === 'insert' || stmtIn.kind === 'update' || stmtIn.kind === 'delete')
+    ? bindStmt(stmtIn, session) : stmtIn;
   if (stmt.kind === 'set') {
     for (const a of stmt.assigns) {
       const key = String(a.name).split('.').pop();
@@ -1075,9 +1826,9 @@ async function run(dataStore, session, stmt) {
   if (stmt.kind === 'show-table-status') {
     const db = stmt.schema || requireDb(session);
     const headers = ['Name', 'Engine', 'Version', 'Row_format', 'Rows', 'Avg_row_length', 'Data_length', 'Max_data_length', 'Index_length', 'Data_free', 'Auto_increment', 'Create_time', 'Update_time', 'Check_time', 'Collation', 'Checksum', 'Create_options', 'Comment'];
-    const line = (n) => [n, 'Funx', null, 'Dynamic', null, null, null, null, null, null, null, null, null, null, 'utf8mb4_general_ci', null, '', ''];
+    const line = (n) => [n, 'InnoDB', null, 'Dynamic', null, null, null, null, null, null, null, null, null, null, 'utf8mb4_general_ci', null, '', ''];
     if (db === 'information_schema') {
-      return result(headers.map((n) => col(n, 'string')), ['schemata', 'tables', 'columns'].map(line));
+      return result(headers.map((n) => col(n, 'string')), ['schemata', 'tables', 'columns', 'statistics'].map(line));
     }
     const saved = session.database;
     session.database = db;
@@ -1098,7 +1849,7 @@ async function run(dataStore, session, stmt) {
   if (stmt.kind === 'show-tables') {
     const db = stmt.schema || requireDb(session);
     if (db === 'information_schema') {
-      return result([col(`Tables_in_${db}`, 'string')], [['schemata'], ['tables'], ['columns']]);
+      return result([col(`Tables_in_${db}`, 'string')], [['schemata'], ['tables'], ['columns'], ['statistics']]);
     }
     const saved = session.database;
     session.database = db;
@@ -1111,18 +1862,45 @@ async function run(dataStore, session, stmt) {
     return result([col(`Tables_in_${db}`, 'string')], names.map((n) => [n]));
   }
 
+  if (stmt.kind === 'show-index') {
+    const saved = session.database;
+    if (stmt.schema) session.database = stmt.schema;
+    try {
+      const table = await loadSchema(dataStore, session, stmt.name);
+      const headers = ['Table', 'Non_unique', 'Key_name', 'Seq_in_index', 'Column_name', 'Collation', 'Cardinality', 'Sub_part', 'Packed', 'Null', 'Index_type', 'Comment', 'Index_comment'];
+      const lines = [];
+      const pk = table.columns.find((c) => c.primary);
+      const push = (key, unique, column, seq) => lines.push([table.name, unique ? 0 : 1, key, seq, column, 'A', null, null, null, '', 'BTREE', '', '']);
+      if (pk) push('PRIMARY', true, pk.name, 1);
+      for (const ix of table.indexes || []) ix.columns.forEach((c, i) => push(ix.name, ix.unique, c, i + 1));
+      return result(headers.map((n, i) => col(n, i === 1 || i === 3 ? 'int' : 'string')), lines);
+    } finally { session.database = saved; }
+  }
+
   if (stmt.kind === 'show-columns' || stmt.kind === 'show-create') {
     const saved = session.database;
     if (stmt.schema) session.database = stmt.schema;
     try {
       const table = await loadSchema(dataStore, session, stmt.name);
       if (stmt.kind === 'show-create') {
-        const body = table.columns.map((c) => `  \`${c.name}\` ${columnTypeSql(c)}${c.primary ? ' NOT NULL PRIMARY KEY' : ''}`).join(',\n');
-        return result([col('Table', 'string'), col('Create Table', 'string')], [[table.name, `CREATE TABLE \`${table.name}\` (\n${body}\n)`]]);
+        const body = table.columns.map((c) => {
+          const bits = [`  \`${c.name}\` ${columnTypeSql(c)}`];
+          if (c.unsigned) bits.push('unsigned');
+          if (c.nullable === false || c.primary) bits.push('NOT NULL');
+          if (c.autoIncrement) bits.push('AUTO_INCREMENT');
+          if (c.default === 'current_timestamp') bits.push('DEFAULT CURRENT_TIMESTAMP');
+          else if (c.default != null) bits.push(`DEFAULT ${typeof c.default === 'number' ? c.default : `'${c.default}'`}`);
+          if (c.primary) bits.push('PRIMARY KEY');
+          return bits.join(' ');
+        });
+        for (const ix of table.indexes || []) {
+          body.push(`  ${ix.unique ? 'UNIQUE KEY' : 'KEY'} \`${ix.name}\` (${ix.columns.map((c) => `\`${c}\``).join(', ')})`);
+        }
+        return result([col('Table', 'string'), col('Create Table', 'string')], [[table.name, `CREATE TABLE \`${table.name}\` (\n${body.join(',\n')}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`]]);
       }
       const rows = table.columns.map((c) => stmt.full
-        ? [c.name, columnTypeSql(c), 'utf8mb4_general_ci', c.primary ? 'NO' : 'YES', c.primary ? 'PRI' : '', null, '', '']
-        : [c.name, columnTypeSql(c), c.primary ? 'NO' : 'YES', c.primary ? 'PRI' : '', null, '']);
+        ? [c.name, columnTypeSql(c), 'utf8mb4_general_ci', c.nullable === false || c.primary ? 'NO' : 'YES', c.primary ? 'PRI' : '', c.default == null ? null : String(c.default), columnExtra(c), '']
+        : [c.name, columnTypeSql(c), c.nullable === false || c.primary ? 'NO' : 'YES', c.primary ? 'PRI' : '', c.default == null ? null : String(c.default), columnExtra(c)]);
       const columns = stmt.full
         ? ['Field', 'Type', 'Collation', 'Null', 'Key', 'Default', 'Extra', 'Comment'].map((n) => col(n, 'string'))
         : ['Field', 'Type', 'Null', 'Key', 'Default', 'Extra'].map((n) => col(n, 'string'));
@@ -1136,14 +1914,29 @@ async function run(dataStore, session, stmt) {
       const hit = stmt.columns.find((c) => c.name === stmt.tablePk);
       if (!hit) throw sqlError(1072, `primary key ${stmt.tablePk} is not a column`, '42000');
       hit.primary = true;
+      hit.nullable = false;
     }
     const prim = stmt.columns.filter((c) => c.primary);
     if (prim.length !== 1) throw sqlError(1064, 'a table needs exactly one primary key');
-    if (prim[0].type !== 'string') throw sqlError(1235, 'the primary key must be a string (VARCHAR, CHAR, or TEXT)');
+    const indexes = stmt.indexes.slice();
+    for (const c of stmt.columns) {
+      if (c.unique) indexes.push({ name: c.name, unique: true, columns: [c.name] });
+    }
     try {
       await storeCall(() => dataStore.createTable(session.ownerId, db, {
+        mysql: true,
         name: stmt.name,
-        columns: stmt.columns.map((c) => ({ name: c.name, type: c.type, primary: c.primary })),
+        columns: stmt.columns.map((c) => ({
+          name: c.name,
+          type: c.type,
+          primary: c.primary,
+          nullable: c.nullable !== false,
+          autoIncrement: c.autoIncrement === true,
+          default: c.default === undefined ? null : c.default,
+          mysqlType: c.mysqlType,
+          unsigned: c.unsigned === true,
+        })),
+        indexes,
       }));
     } catch (e) {
       if (stmt.ifNotExists && e.errno === 1050) return ok();
@@ -1164,41 +1957,67 @@ async function run(dataStore, session, stmt) {
   if (stmt.kind === 'insert') {
     if (stmt.schema && stmt.schema !== session.database) throw sqlError(1049, `unknown database ${stmt.schema}`, '42000');
     const table = await loadSchema(dataStore, session, stmt.name);
-    const tuples = stmt.set
-      ? [stmt.set.map((s) => s.value)]
-      : stmt.tuples;
+    const tuples = stmt.set ? [stmt.set.map((s) => s.expr)] : stmt.tuples;
     const cols = stmt.set ? stmt.set.map((s) => s.col) : stmt.cols;
-    let n = 0;
+    let affected = 0;
+    let insertId = 0;
     for (const vals of tuples) {
-      const values = valuesFrom(table.columns, cols, vals);
-      await writeRow(dataStore, session, table, values, { replace: stmt.replace });
-      n++;
+      const names = cols || table.columns.map((c) => c.name);
+      if (names.length !== vals.length) throw sqlError(1136, 'column count does not match value count', '21S01');
+      const raw = {};
+      for (let i = 0; i < names.length; i++) {
+        const column = table.columns.find((c) => c.name === names[i]);
+        if (!column) throw sqlError(1054, `unknown column ${names[i]}`, '42S22');
+        const v = evalExpr(vals[i], { session, row: null, group: null });
+        if (vals[i] && vals[i].def) continue;
+        raw[column.name] = v;
+      }
+      const one = await insertOne(dataStore, session, table, raw, stmt);
+      affected += one.affected;
+      if (!insertId && one.insertId) insertId = one.insertId;
     }
-    return ok(n);
+    return ok(affected, insertId);
   }
 
   if (stmt.kind === 'update' || stmt.kind === 'delete') {
     if (stmt.schema && stmt.schema !== session.database) throw sqlError(1049, `unknown database ${stmt.schema}`, '42000');
     const table = await loadSchema(dataStore, session, stmt.name);
-    let rows = (await scanTable(dataStore, session, table.name)).filter((r) => rowMatches(table.columns, r, stmt.where));
-    rows = sortRows(table.columns, rows, stmt.order);
-    rows = sliceLimit(rows, stmt.limit, stmt.offset);
-    const tx = ensureTx(session);
-    const apply = async (fn) => {
-      if (tx) { await fn({ putRow: async (t, pk, values) => { overlayTable(session, t).set(pk, { pk, values }); }, deleteRow: async (t, pk) => { overlayTable(session, t).set(pk, null); } }); return; }
-      await storeCall(() => dataStore.transact(session.ownerId, session.database, fn));
-    };
-    await apply(async (txc) => {
+    let rows = (await readVisible(dataStore, session, table)).map((r) => ({
+      pk: r.pk,
+      values: r.values,
+      parts: { [table.name]: { values: r.values, columns: table.columns } },
+    }));
+    if (stmt.where) rows = rows.filter((r) => truthy(evalExpr(stmt.where, { session, row: r, group: null })));
+    if (stmt.order) {
+      rows = [...rows].sort((a, b) => {
+        for (const o of stmt.order) {
+          const av = evalExpr(o.expr, { session, row: a, group: null });
+          const bv = evalExpr(o.expr, { session, row: b, group: null });
+          if (cmpValues(av, bv, '<')) return o.desc ? 1 : -1;
+          if (cmpValues(av, bv, '>')) return o.desc ? -1 : 1;
+        }
+        return 0;
+      });
+    }
+    const start = stmt.offset || 0;
+    rows = stmt.limit == null ? rows.slice(start) : rows.slice(start, start + stmt.limit);
+    const pkCol = primaryOf(table.columns);
+    await applyWrites(dataStore, session, table, async (tx) => {
       for (const row of rows) {
-        if (stmt.kind === 'delete') { await txc.deleteRow(table.name, row.pk); continue; }
+        if (stmt.kind === 'delete') { await tx.del(row.pk); continue; }
         const values = { ...row.values };
         for (const set of stmt.set) {
           const column = table.columns.find((c) => c.name === set.col);
           if (!column) throw sqlError(1054, `unknown column ${set.col}`, '42S22');
           if (column.primary) throw sqlError(1235, 'changing the primary key is not supported');
-          values[column.name] = coerce(column, set.value);
+          values[column.name] = coerce(column, evalExpr(set.expr, { session, row, group: null }));
         }
-        await txc.putRow(table.name, row.pk, values);
+        values[pkCol.name] = row.values[pkCol.name];
+        const clash = findConflict(table, tx.rows, values, row.pk);
+        if (clash) throw sqlError(1062, 'duplicate entry', '23000');
+        await tx.put(row.pk, values);
+        const live = tx.rows.find((r) => r.pk === row.pk);
+        if (live) live.values = values;
       }
     });
     return ok(rows.length);
@@ -1212,19 +2031,22 @@ async function forEachStatement(dataStore, session, sql, onResult) {
   const parts = splitStatements(String(sql));
   if (!parts.length) throw sqlError(1064, 'empty statement');
   for (let i = 0; i < parts.length; i++) {
-    const result = await run(dataStore, session, parseStatement(parts[i]));
-    await onResult(result, i < parts.length - 1);
+    const out = await run(dataStore, session, parseStatement(parts[i]));
+    await onResult(out, i < parts.length - 1);
   }
 }
 
 async function executeSql(dataStore, session, sql) {
   const out = [];
-  await forEachStatement(dataStore, session, sql, async (result) => { out.push(result); });
+  await forEachStatement(dataStore, session, sql, async (one) => { out.push(one); });
   return out;
 }
 
 function newSession({ ownerId, username, database = null }) {
-  return { ownerId, username, database, autocommit: true, explicitTx: false, overlay: null };
+  return {
+    ownerId, username, database, autocommit: true, explicitTx: false, overlay: null,
+    params: null, statements: new Map(), nextStmt: 1,
+  };
 }
 
-module.exports = { executeSql, forEachStatement, newSession, sqlError, SERVER_VERSION, splitStatements };
+module.exports = { executeSql, forEachStatement, newSession, sqlError, SERVER_VERSION, splitStatements, tokenize };

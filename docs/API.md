@@ -67,15 +67,15 @@ Not a worker binding. An account's rows live in one physical table, shared by ev
 
 404 when the listener is not configured, or when the caller is the platform owner. The MySQL user is the account id when that id is 1–32 characters of letters, digits and `_`. Otherwise it is `f` plus 31 hex characters of the id's SHA-256.
 
-A client uses the normal text protocol and `mysql_native_password` (the `mysql` CLI, a GUI, or an application connection string). Example, after `POST /v1/mysql`:
+A client uses the MySQL protocol and `mysql_native_password` (the `mysql` CLI, a GUI, or an application connection string). Prepared statements (`COM_STMT_PREPARE` / `COM_STMT_EXECUTE`) return binary rows. If the client asks for TLS, the server completes the handshake with `FUNX_MYSQL_TLS_CERT` and `FUNX_MYSQL_TLS_KEY`, or with a self-signed certificate generated at startup. A client that verifies certificates against a public CA will refuse that certificate. Example, after `POST /v1/mysql`:
 
 ```
 mysql -h <host> -P <port> -u <user> -p
 ```
 
-What works: `CREATE`/`DROP DATABASE`, `CREATE`/`DROP TABLE`, `INSERT`, `REPLACE`, `UPDATE`, `DELETE`, `SELECT`, `USE`, `BEGIN`/`COMMIT`/`ROLLBACK`, `SHOW DATABASES`/`TABLES`/`COLUMNS`/`CREATE TABLE`/`VARIABLES`/`TABLE STATUS`, `DESCRIBE`, and `information_schema` for schemata, tables and columns. `WHERE` is `AND` of comparisons and `IS NULL`. `ORDER BY` and `LIMIT` work. `SET NAMES` and `SET autocommit` are accepted.
+What works: `CREATE`/`DROP DATABASE`, `CREATE`/`DROP TABLE` (including `ENGINE`, charset, `AUTO_INCREMENT`, `DEFAULT`, `NOT NULL`, `UNIQUE`, and secondary `KEY`s), `INSERT`, `REPLACE`, `ON DUPLICATE KEY UPDATE`, `UPDATE`, `DELETE`, `SELECT` with `JOIN`, `WHERE` (`AND`, `OR`, `NOT`, `IN`, `LIKE`, `BETWEEN`), `GROUP BY` (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG`), `ORDER BY`, and `LIMIT`. Primary keys may be `VARCHAR` or an integer. Column types on this path: `VARCHAR`/`TEXT`, `INT`/`BIGINT` (safe integer), `BOOL`, `DOUBLE`, `DECIMAL`, `DATETIME`/`TIMESTAMP`, `JSON`, and `BLOB`. `SHOW DATABASES`/`TABLES`/`COLUMNS`/`INDEX`/`CREATE TABLE`/`VARIABLES`/`TABLE STATUS`, `DESCRIBE`, and `information_schema` for schemata, tables, columns, and statistics. `SET NAMES` and `SET autocommit` are accepted. A row written over MySQL may be up to 4 MB. Autocommit is on until the session turns it off; `BEGIN` keeps the change in the session until `COMMIT` or `ROLLBACK`. `UNIQUE` is checked again at `COMMIT`.
 
-What answers with an error: `JOIN`, `OR`, `GROUP BY`, a second index, a primary key that is not a string, fractional numbers, prepared statements (`COM_STMT_PREPARE`), and TLS. Column types are `VARCHAR` (string), `INT` (safe integer), `BOOL`, and `JSON`. A table has exactly one primary key, and it is a string, so the row order is that key's bytes. A row is at most 32 KB. Autocommit is on until the session turns it off; `BEGIN` keeps the change in the session until `COMMIT` or `ROLLBACK`.
+What answers with an error: stored procedures, triggers, views, subqueries, `UNION`, window functions, and a composite primary key. The HTTP API does not grow with this surface: it still allows only a string primary key and `string`, `int`, `bool`, `json`, and it still caps a row at 32 KB.
 
 ### HTTP
 
