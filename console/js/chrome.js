@@ -1,4 +1,5 @@
 // Page chrome shared by all routes. Pure (no DOM, no storage) so it can be tested in Node.
+import { isListHash } from './routes.js';
 
 // Mock mode only when the deployment config has no apiBase. A real-backend build can never be
 // switched into mock mode (no ?mock override), so the sample-data label can't appear there.
@@ -23,7 +24,7 @@ export function headerHtml({ t, lang, mock, user, hash = '', minimal = false, ti
   return `
   <header class="top">
     <a class="wordmark" href="#/" aria-label="funx">funx</a>
-    <nav class="nav"><a href="#/workers" class="${hash.startsWith('#/workers') ? 'on' : ''}">${t('workers')}</a></nav>
+    <nav class="nav"><a href="#/"${isListHash(hash) ? ' class="on"' : ''}>${t('workers')}</a></nav>
     ${crumbs ? `<div class="crumbs">${crumbs}</div>` : ''}
     ${title ? `<h1 class="sr">${esc(title)}</h1>` : ''}
     <div class="spacer"></div>

@@ -1,16 +1,19 @@
 // Funx console: static SPA, hash routes, no build step.
-//   #/                 editor with a runnable sample (first screen)
-//   #/workers          worker list
-//   #/w/<name>         editor for a deployed worker
-//   #/w/<name>/settings  vars, secrets, disable, delete
-//   #/login            email + password
-//   #/setup?t=<token>  one-time password setup link (token removed from the URL at once)
+//   #/                          worker list (home)
+//   #/new                       editor for a worker that has no name yet
+//   #/workers/<name>            editor for a deployed worker
+//   #/workers/<name>/settings   vars, secrets, disable, delete
+//   #/workers                   old list URL; redirects to #/
+//   #/w/<name>[/settings]       old editor URL; redirects to #/workers/<name>
+//   #/login                     email + password
+//   #/setup?t=<token>           one-time password setup link (token removed from the URL at once)
 import { t, getLang, setLang } from './i18n.js';
 import { createClient, ApiError } from './api.js';
 import { runInBrowser } from './runner.js';
 import { sample, isSample } from './sample.js';
 import { staticCodeHtml } from './highlight.js';
 import { isMockMode, headerHtml } from './chrome.js';
+import { resolveRoute } from './routes.js';
 
 const cfg = window.FUNX_CONFIG || {};
 const apiBase = isMockMode(cfg) ? '' : cfg.apiBase.trim();
@@ -80,7 +83,7 @@ function loginPage() {
       btn.disabled = true;
       try {
         await (mode === 'login' ? api.login(fd.get('email'), fd.get('password')) : api.register(fd.get('email'), fd.get('password')));
-        location.hash = sessionStorage.getItem('funx.next') || '#/workers';
+        location.hash = sessionStorage.getItem('funx.next') || '#/';
         sessionStorage.removeItem('funx.next');
       } catch (e) { $('#err').innerHTML = `${icon.warn}<span>${esc(errText(e))}</span>`; btn.disabled = false; }
     };
@@ -161,7 +164,7 @@ async function setupPage() {
     try {
       await api.setup(setupToken, fd.get('password'));
       setupToken = null;
-      location.hash = '#/workers';
+      location.hash = '#/';
     } catch (e) {
       if (e instanceof ApiError && e.status === 410) { setupToken = null; return expiredPage(); }
       showErr(errText(e)); btn.disabled = false;
@@ -172,24 +175,24 @@ async function setupPage() {
 // ---------- list ----------
 
 async function listPage() {
-  if (!api.session.token) { sessionStorage.setItem('funx.next', '#/workers'); location.hash = '#/login'; return; }
-  const shell = (body) => `${header({ actions: `<a class="primary btnlike" href="#/">${t('new')}</a>` })}
+  if (!api.session.token) { sessionStorage.setItem('funx.next', '#/'); location.hash = '#/login'; return; }
+  const shell = (body) => `${header({ actions: `<a class="primary btnlike" href="#/new">${t('new')}</a>` })}
     <main class="page"><div class="pagehead"><h1>${t('workers')}</h1></div>${body}</main>`;
   app.innerHTML = shell(`<div class="table skeleton" aria-busy="true">${'<div class="row sk"></div>'.repeat(3)}</div>`);
   bindHeader();
   let rows;
   try { rows = await api.list(); } catch (e) { app.innerHTML = shell(`<p class="formerr">${icon.warn}<span>${esc(errText(e))}</span></p>`); bindHeader(); return; }
   const body = !rows.length
-    ? `<div class="card empty"><p>${t('empty')}</p><a class="primary btnlike" href="#/">${t('emptyCta')}</a></div>`
+    ? `<div class="card empty"><p>${t('empty')}</p><a class="primary btnlike" href="#/new">${t('emptyCta')}</a></div>`
     : `<div class="table" role="table">
         <div class="row head" role="row"><span>${t('name')}</span><span>${t('url')}</span><span>${t('status')}</span><span title="UTC+8">${t('lastDeploy')}</span><span></span></div>
         ${rows.map((w) => `
         <div class="row" role="row">
-          <a class="name" href="#/w/${esc(w.name)}">${esc(w.name)}</a>
+          <a class="name" href="#/workers/${esc(w.name)}">${esc(w.name)}</a>
           <a class="mono url" href="${esc(w.url)}" target="_blank" rel="noopener">${esc(w.url.replace('https://', ''))}</a>
           <span class="state ${w.disabled ? 'off' : ''}"><i></i>${w.disabled ? t('disabled') : t('running')}</span>
           <span class="mono muted time">${fmtTime(w.last_deploy)}</span>
-          <span class="rowact"><a class="ghost small btnlike" href="#/w/${esc(w.name)}/settings">${t('settings')}</a></span>
+          <span class="rowact"><a class="ghost small btnlike" href="#/workers/${esc(w.name)}/settings">${t('settings')}</a></span>
         </div>`).join('')}
       </div>`;
   app.innerHTML = shell(body);
@@ -223,7 +226,7 @@ async function editorPage(name) {
     </span>` : '');
 
   const crumbs = name
-    ? `<span class="mono wname">${esc(name)}</span><a class="ghost small btnlike" href="#/w/${esc(name)}/settings">${t('settings')}</a>`
+    ? `<span class="mono wname">${esc(name)}</span><a class="ghost small btnlike" href="#/workers/${esc(name)}/settings">${t('settings')}</a>`
     : `<input class="mono wname-in" id="wname" value="${esc(state.name)}" placeholder="${t('namePh')}" aria-label="${t('name')}" spellcheck="false" autocomplete="off">`;
 
   app.innerHTML = `${header({ crumbs, actions: `${urlBlock()}<button class="primary deploy" id="deploy">${t('deploy')}</button>` })}
@@ -369,7 +372,7 @@ async function editorPage(name) {
 
   $('#deploy').addEventListener('click', async () => {
     const target = name || ($('#wname').value || '').trim();
-    if (!api.session.token) { saveDraft(); sessionStorage.setItem('funx.next', location.hash || '#/'); toast(t('loginToDeploy')); location.hash = '#/login'; return; }
+    if (!api.session.token) { saveDraft(); sessionStorage.setItem('funx.next', location.hash || '#/new'); toast(t('loginToDeploy')); location.hash = '#/login'; return; }
     if (!NAME_RE.test(target)) { toast(t('nameRule'), 'bad'); $('#wname')?.focus(); return; }
     const btn = $('#deploy');
     btn.disabled = true; btn.textContent = t('deploying');
@@ -380,7 +383,7 @@ async function editorPage(name) {
       btn.insertAdjacentHTML('beforebegin', urlBlock());
       bindCopy();
       toast(t('deployed'), 'ok');
-      if (!name) { localStorage.removeItem(DRAFT_KEY); history.replaceState(null, '', `#/w/${target}`); name = target; }
+      if (!name) { localStorage.removeItem(DRAFT_KEY); history.replaceState(null, '', `${location.pathname}${location.search}#/workers/${target}`); name = target; }
     } catch (e) { toast(errText(e), 'bad'); }
     btn.disabled = false; btn.textContent = t('deploy');
   });
@@ -391,11 +394,11 @@ async function editorPage(name) {
 async function settingsPage(name) {
   if (!api.session.token) { sessionStorage.setItem('funx.next', location.hash); location.hash = '#/login'; return; }
   let w;
-  const crumbs = `<a class="mono wname" href="#/w/${esc(name)}">${esc(name)}</a>`;
+  const crumbs = `<a class="mono wname" href="#/workers/${esc(name)}">${esc(name)}</a>`;
   try { w = await api.get(name); } catch (e) { app.innerHTML = `${header({ crumbs })}<main class="page"><p class="formerr">${icon.warn}<span>${esc(errText(e))}</span></p></main>`; bindHeader(); return; }
 
   const draw = () => {
-    app.innerHTML = `${header({ crumbs, actions: `<a class="primary btnlike" href="#/w/${esc(name)}">${t('editor')}</a>` })}
+    app.innerHTML = `${header({ crumbs, actions: `<a class="primary btnlike" href="#/workers/${esc(name)}">${t('editor')}</a>` })}
     <main class="page narrow">
       <div class="pagehead"><h1>${t('settings')}</h1><a class="mono muted" href="${esc(w.url)}" target="_blank" rel="noopener">${esc(w.url.replace('https://', ''))}</a></div>
 
@@ -432,7 +435,7 @@ async function settingsPage(name) {
     app.querySelectorAll('[data-delsecret]').forEach((b) => { b.onclick = () => act(() => api.deleteSecret(name, b.dataset.delsecret)); });
     $('#toggle').onclick = () => act(() => api.setDisabled(name, !w.disabled));
     $('#confirm').oninput = (e) => { $('#del').disabled = e.target.value !== name; };
-    $('#del').onclick = async () => { try { await api.remove(name); location.hash = '#/workers'; } catch (e) { toast(errText(e), 'bad'); } };
+    $('#del').onclick = async () => { try { await api.remove(name); location.hash = '#/'; } catch (e) { toast(errText(e), 'bad'); } };
   };
   draw();
 }
@@ -440,14 +443,17 @@ async function settingsPage(name) {
 // ---------- router ----------
 
 function render() {
-  const h = location.hash || '#/';
-  const m = h.match(/^#\/w\/([a-z0-9-]+)(\/settings)?$/);
+  let route = resolveRoute(location.hash);
   window.scrollTo(0, 0);
-  if (h.startsWith('#/login')) return loginPage();
-  if (h.startsWith('#/setup')) return setupPage();
-  if (h.startsWith('#/workers')) return listPage();
-  if (m) return m[2] ? settingsPage(m[1]) : editorPage(m[1]);
-  return editorPage(null);
+  if (route.page === 'redirect') {
+    history.replaceState(null, '', `${location.pathname}${location.search}${route.to}`);
+    route = resolveRoute(route.to);
+  }
+  if (route.page === 'login') return loginPage();
+  if (route.page === 'setup') return setupPage();
+  if (route.page === 'list') return listPage();
+  if (route.page === 'settings') return settingsPage(route.name);
+  return editorPage(route.name);
 }
 
 window.addEventListener('hashchange', render);

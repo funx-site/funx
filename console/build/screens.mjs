@@ -46,7 +46,7 @@ for (const [label, viewport, mobile] of [['desktop', { width: 1440, height: 900 
   let release;
   const gate = new Promise((r) => { release = r; });
   await page.route('**/vendor/codemirror.js', async (route) => { await gate; await route.continue(); });
-  await page.goto(base + '#/');
+  await page.goto(base + '#/new');
   await page.waitForSelector('#code .cs-row');
   await shot('10-first-paint-static');
   release();
@@ -70,10 +70,11 @@ for (const [label, viewport, mobile] of [['desktop', { width: 1440, height: 900 
     localStorage.setItem('funx.user', JSON.stringify({ id: 'me', email: 'user@example.com', role: 'user' }));
   }, SEED);
   await page.goto(base + '#/workers'); await page.reload();
+  await page.waitForFunction(() => location.hash === '#/');
   await page.waitForSelector('.row .name');
   await shot('03-list');
 
-  await page.goto(base + '#/w/hello');
+  await page.goto(base + '#/workers/hello');
   await page.waitForSelector('#deployed');
   await page.waitForSelector('.cm-host.ready');
   await shot('04-editor-deployed-code');
@@ -83,16 +84,17 @@ for (const [label, viewport, mobile] of [['desktop', { width: 1440, height: 900 
   await page.waitForSelector('.status');
   await shot('04-editor-deployed-test');
 
-  await page.goto(base + '#/w/webhook'); await page.waitForSelector('#deployed');
+  await page.goto(base + '#/workers/webhook'); await page.waitForSelector('#deployed');
   if (mobile) await page.click('.tabs [data-tab="test"]');
   await page.click('.seg [data-mode="live"]');
   await page.click('#send'); await page.waitForSelector('.status');
   await shot('05-editor-non2xx');
 
-  await page.goto(base + '#/w/time-api'); await page.waitForSelector('.cm-host.ready'); await page.waitForTimeout(150);
+  await page.goto(base + '#/workers/time-api'); await page.waitForSelector('.cm-host.ready'); await page.waitForTimeout(150);
   await shot('08-editor-long-line');
 
   await page.goto(base + '#/w/hello/settings');
+  await page.waitForFunction(() => location.hash === '#/workers/hello/settings');
   await page.waitForSelector('#varf');
   await shot('06-settings', true);
 
