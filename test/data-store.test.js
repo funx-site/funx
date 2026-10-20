@@ -156,7 +156,19 @@ test('quotas apply to both stores', async () => {
     await store.createTable('o', 'app', { name: 'notes', columns: [{ name: 'id', type: 'string', primary: true }, { name: 'title', type: 'string' }] });
     await rejects(store.createTable('o', 'app', { name: 'more', columns: [{ name: 'id', type: 'string', primary: true }] }), 'quota');
     await rejects(store.putRow('o', 'app', 'notes', 'k', { title: 'x'.repeat(40) }), 'bad_row');
-    assert.equal((await store.putRow('o', 'app', 'notes', 'k', { title: 'ok' })).created, true);
+    await store.putRow('o', 'app', 'notes', 'k', { title: 'ok' });
+    await store.updateTable('o', 'app', 'notes', {
+      mysql: true,
+      columns: [
+        { name: 'id', type: 'string', primary: true },
+        { name: 'title', type: 'string' },
+        { name: 'n', type: 'int' },
+      ],
+      indexes: [],
+    });
+    await store.renameTable('o', 'app', 'notes', 'notes2');
+    assert.equal((await store.getTable('o', 'app', 'notes2')).columns.some((c) => c.name === 'n'), true);
+    assert.equal((await store.getRow('o', 'app', 'notes2', 'k')).values.title, 'ok');
   }
 });
 
@@ -256,40 +268,42 @@ test('http: /v1/databases is owner-scoped; without a store it stays 404', async 
   try {
     assert.equal((await call('GET', '/v1/databases')).status, 401);
     assert.equal((await call('GET', '/v1/workers', { token: tok('u1') })).json.workers.length, 0);
-    const created = await call('POST', '/v1/databases', { token: tok('u1'), body: { name: 'app' } });
-    assert.equal(created.status, 201);
-    assert.equal(created.json.node_id, 0);
-    assert.equal(created.json.owner, 'u1');
-    assert.equal((await call('POST', '/v1/databases', { token: tok('u1'), body: { name: 'other' } })).status, 409);
-    assert.equal((await call('GET', '/v1/databases/app', { token: tok('u2') })).status, 404);
-    assert.equal((await call('GET', '/v1/databases/app', { token: tok('admin', 'admin') })).status, 404);
+    assert.equal((await call('POST', '/v1/databases', { token: tok('u1'), body: { name: 'app' } })).status, 405);
+    const created = await call('GET', '/v1/databases', { token: tok('u1') });
+    assert.equal(created.status, 200);
+    assert.deepEqual(created.json.databases.map((d) => d.name), ['db']);
+    assert.equal(created.json.databases[0].owner, 'u1');
+    assert.equal(created.json.databases[0].node_id, 0);
+    assert.equal((await call('GET', '/v1/databases/app', { token: tok('u1') })).status, 404);
+    assert.equal((await call('DELETE', '/v1/databases/db', { token: tok('u1') })).status, 405);
     assert.equal((await call('GET', '/v1/databases', { token: tok('funx') })).status, 404);
     assert.equal((await call('DELETE', '/v1/databases/platform', { token: tok('funx') })).status, 404);
-    assert.deepEqual((await call('GET', '/v1/databases', { token: tok('u2') })).json.databases, []);
-    const table = await call('POST', '/v1/databases/app/tables', {
+    const other = await call('GET', '/v1/databases', { token: tok('u2') });
+    assert.deepEqual(other.json.databases.map((d) => [d.name, d.owner]), [['db', 'u2']]);
+    const table = await call('POST', '/v1/databases/db/tables', {
       token: tok('u1'),
       body: { name: 'notes', columns: [{ name: 'id', type: 'string', primary: true }, { name: 'title', type: 'string' }] },
     });
     assert.equal(table.status, 201, JSON.stringify(table.json));
     const pk = 'a/b 100%';
-    const put = await call('PUT', `/v1/databases/app/tables/notes/rows/${encodeURIComponent(pk)}`, { token: tok('u1'), body: { title: 'hi' } });
+    const put = await call('PUT', `/v1/databases/db/tables/notes/rows/${encodeURIComponent(pk)}`, { token: tok('u1'), body: { title: 'hi' } });
     assert.equal(put.status, 201);
     assert.equal(put.json.created, true);
     assert.equal(put.json.values.title, 'hi');
     assert.equal(put.json.values.id, pk);
-    const got = await call('GET', `/v1/databases/app/tables/notes/rows/${encodeURIComponent(pk)}`, { token: tok('u1') });
+    const got = await call('GET', `/v1/databases/db/tables/notes/rows/${encodeURIComponent(pk)}`, { token: tok('u1') });
     assert.equal(got.status, 200);
     assert.equal(got.json.values.title, 'hi');
-    const replaced = await call('PUT', `/v1/databases/app/tables/notes/rows/${encodeURIComponent(pk)}`, { token: tok('u1'), body: { title: 'yo' } });
+    const replaced = await call('PUT', `/v1/databases/db/tables/notes/rows/${encodeURIComponent(pk)}`, { token: tok('u1'), body: { title: 'yo' } });
     assert.equal(replaced.status, 200);
     assert.equal(replaced.json.created, false);
-    const listed = await call('GET', '/v1/databases/app/tables/notes/rows?limit=10', { token: tok('u1') });
+    const listed = await call('GET', '/v1/databases/db/tables/notes/rows?limit=10', { token: tok('u1') });
     assert.deepEqual(listed.json.rows.map((r) => r.pk), [pk]);
-    assert.equal((await call('POST', `/v1/databases/app/tables/notes/rows/${encodeURIComponent(pk)}`, { token: tok('u1'), body: {} })).status, 405);
-    assert.equal((await call('GET', '/v1/databases/app/settings', { token: tok('u1') })).status, 404);
-    assert.equal((await call('DELETE', `/v1/databases/app/tables/notes/rows/${encodeURIComponent(pk)}`, { token: tok('u1') })).status, 200);
-    assert.equal((await call('DELETE', '/v1/databases/app/tables/notes', { token: tok('u1') })).json.deleted, 'notes');
-    assert.equal((await call('DELETE', '/v1/databases/app', { token: tok('u1') })).json.deleted, 'app');
-    assert.equal((await call('GET', '/v1/databases/app', { token: tok('u1') })).status, 404);
+    assert.equal((await call('GET', '/v1/databases/db/tables', { token: tok('u2') })).json.tables.length, 0);
+    assert.equal((await call('POST', `/v1/databases/db/tables/notes/rows/${encodeURIComponent(pk)}`, { token: tok('u1'), body: {} })).status, 405);
+    assert.equal((await call('GET', '/v1/databases/db/settings', { token: tok('u1') })).status, 404);
+    assert.equal((await call('DELETE', `/v1/databases/db/tables/notes/rows/${encodeURIComponent(pk)}`, { token: tok('u1') })).status, 200);
+    assert.equal((await call('DELETE', '/v1/databases/db/tables/notes', { token: tok('u1') })).json.deleted, 'notes');
+    assert.equal((await call('GET', '/v1/databases/db', { token: tok('u1') })).json.name, 'db');
   } finally { await srv.close(); }
 });

@@ -5,6 +5,7 @@
 
 const crypto = require('crypto');
 const { PlatformDb, PLATFORM_OWNER } = require('./platform-data');
+const { ACCOUNT_DB, ensureAccountDatabase } = require('./data-store');
 
 function mysqlUserName(ownerId) {
   if (ownerId === PLATFORM_OWNER) {
@@ -47,15 +48,16 @@ async function accountRow(dataStore, username) {
 
 async function mysqlAccountView(dataStore, ownerId, endpoint) {
   const user = mysqlUserName(ownerId);
+  await ensureAccountDatabase(dataStore, ownerId);
   const row = await accountRow(dataStore, user);
-  const databases = (await dataStore.listDatabases(ownerId)).map((d) => d.name);
   return {
     host: endpoint.host,
     port: endpoint.port,
     user,
     password_set: !!row,
-    databases,
-    uri: connectionUri({ host: endpoint.host, port: endpoint.port, user }),
+    database: ACCOUNT_DB,
+    databases: [ACCOUNT_DB],
+    uri: connectionUri({ host: endpoint.host, port: endpoint.port, user, database: ACCOUNT_DB }),
   };
 }
 
@@ -72,13 +74,14 @@ async function rotateMysqlPassword(dataStore, ownerId) {
     auth_string: nativeHash(password),
     created_at,
   });
-  const databases = (await dataStore.listDatabases(ownerId)).map((d) => d.name);
+  await ensureAccountDatabase(dataStore, ownerId);
   return {
     host: null,
     user: username,
     password,
     password_set: true,
-    databases,
+    database: ACCOUNT_DB,
+    databases: [ACCOUNT_DB],
   };
 }
 
@@ -87,7 +90,7 @@ function withEndpoint(view, endpoint) {
     ...view,
     host: endpoint.host,
     port: endpoint.port,
-    uri: connectionUri({ host: endpoint.host, port: endpoint.port, user: view.user, password: view.password }),
+    uri: connectionUri({ host: endpoint.host, port: endpoint.port, user: view.user, password: view.password, database: view.database }),
   };
 }
 

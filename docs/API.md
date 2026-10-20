@@ -62,20 +62,22 @@ Not a worker binding. An account's rows live in one physical table, shared by ev
 
 | Method | Path | Body | Notes |
 | --- | --- | --- | --- |
-| GET | `/v1/mysql` | | `{host, port, user, password_set, databases, uri}` — `uri` has no password |
-| POST | `/v1/mysql` | `{}` | rotates the password; `{host, port, user, password, password_set, databases, uri}` |
+| GET | `/v1/mysql` | | `{host, port, user, password_set, database, databases, uri}` — `database` is `db`; `uri` has no password |
+| POST | `/v1/mysql` | `{}` | rotates the password; the password is in this response only |
 
 404 when the listener is not configured, or when the caller is the platform owner. The MySQL user is the account id when that id is 1–32 characters of letters, digits and `_`. Otherwise it is `f` plus 31 hex characters of the id's SHA-256.
 
 A client uses the MySQL protocol and `mysql_native_password` (the `mysql` CLI, a GUI, or an application connection string). Prepared statements (`COM_STMT_PREPARE` / `COM_STMT_EXECUTE`) return binary rows. If the client asks for TLS, the server completes the handshake with `FUNX_MYSQL_TLS_CERT` and `FUNX_MYSQL_TLS_KEY`, or with a self-signed certificate generated at startup. A client that verifies certificates against a public CA will refuse that certificate. Example, after `POST /v1/mysql`:
 
 ```
-mysql -h <host> -P <port> -u <user> -p
+mysql -h <host> -P <port> -u <user> -p db
 ```
 
-What works: `CREATE`/`DROP DATABASE`, `CREATE`/`DROP TABLE` (including `ENGINE`, charset, `AUTO_INCREMENT`, `DEFAULT`, `NOT NULL`, `UNIQUE`, and secondary `KEY`s), `INSERT`, `REPLACE`, `ON DUPLICATE KEY UPDATE`, `UPDATE`, `DELETE`, `SELECT` with `JOIN`, `WHERE` (`AND`, `OR`, `NOT`, `IN`, `LIKE`, `BETWEEN`), `GROUP BY` (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG`), `ORDER BY`, and `LIMIT`. Primary keys may be `VARCHAR` or an integer. Column types on this path: `VARCHAR`/`TEXT`, `INT`/`BIGINT` (safe integer), `BOOL`, `DOUBLE`, `DECIMAL`, `DATETIME`/`TIMESTAMP`, `JSON`, and `BLOB`. `SHOW DATABASES`/`TABLES`/`COLUMNS`/`INDEX`/`CREATE TABLE`/`VARIABLES`/`TABLE STATUS`, `DESCRIBE`, and `information_schema` for schemata, tables, columns, and statistics. `SET NAMES` and `SET autocommit` are accepted. A row written over MySQL may be up to 4 MB. Autocommit is on until the session turns it off; `BEGIN` keeps the change in the session until `COMMIT` or `ROLLBACK`. `UNIQUE` is checked again at `COMMIT`.
+The session is already in `db`. `CREATE DATABASE`, `DROP DATABASE`, and `USE` of another name answer with an error. `SHOW DATABASES` returns `db`.
 
-What answers with an error: stored procedures, triggers, views, subqueries, `UNION`, window functions, and a composite primary key. The HTTP API does not grow with this surface: it still allows only a string primary key and `string`, `int`, `bool`, `json`, and it still caps a row at 32 KB.
+What works inside that database: `CREATE`/`DROP`/`ALTER`/`RENAME`/`TRUNCATE TABLE` (including `ENGINE`, charset, `AUTO_INCREMENT`, `DEFAULT`, `NOT NULL`, `UNIQUE`, `ADD`/`DROP COLUMN`, and secondary `KEY`s), `CREATE`/`DROP INDEX`, `INSERT`, `REPLACE`, `ON DUPLICATE KEY UPDATE`, `UPDATE`, `DELETE`, and `SELECT` with `JOIN`, `WHERE` (`AND`, `OR`, `NOT`, `IN`, `LIKE`, `BETWEEN`), `GROUP BY` (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG`), `ORDER BY`, and `LIMIT`. Primary keys may be `VARCHAR` or an integer. Column types on this path: `VARCHAR`/`TEXT`, `INT`/`BIGINT` (safe integer), `BOOL`, `DOUBLE`, `DECIMAL`, `DATETIME`/`TIMESTAMP`, `JSON`, and `BLOB`. `SHOW TABLES`/`COLUMNS`/`INDEX`/`CREATE TABLE`/`VARIABLES`/`TABLE STATUS`, `DESCRIBE`, and `information_schema` for this database's tables, columns, and statistics. `SET NAMES` and `SET autocommit` are accepted. A row written over MySQL may be up to 4 MB. Autocommit is on until the session turns it off; `BEGIN` keeps the change in the session until `COMMIT` or `ROLLBACK`. `UNIQUE` is checked again at `COMMIT`.
+
+What answers with an error: anything above the database (creating, dropping, or switching databases), stored procedures, triggers, views, subqueries, `UNION`, window functions, and a composite primary key. Changing a column's storage type is refused. The HTTP API does not grow with this surface: it still allows only a string primary key and `string`, `int`, `bool`, `json`, and it still caps a row at 32 KB. HTTP does not create or delete the database.
 
 ### HTTP
 
@@ -83,17 +85,16 @@ What answers with an error: stored procedures, triggers, views, subqueries, `UNI
 
 | Method | Path | Body | Notes |
 | --- | --- | --- | --- |
-| GET | `/v1/databases` | | `{databases: [{name, owner, node_id, ddl_version, created_at}]}` for this account |
-| POST | `/v1/databases` | `{name}` | 201; 409 `exists` or `quota` (32 per account) |
-| GET | `/v1/databases/:name` | | 404 `not_found` for a missing name and for another account's name |
-| DELETE | `/v1/databases/:name` | | drops its tables and rows |
-| GET | `/v1/databases/:name/tables` | | `{tables: [{name, columns, created_at}]}` |
-| POST | `/v1/databases/:name/tables` | `{name, columns: [{name, type, primary?}]}` | exactly one `primary: true` column; unknown column properties are rejected |
-| GET | `/v1/databases/:name/tables/:table` | | |
-| DELETE | `/v1/databases/:name/tables/:table` | | |
-| GET | `/v1/databases/:name/tables/:table/rows` | | `?limit=` (1-100, default 50) `&after=<pk>`; `{rows, next}` |
-| PUT | `/v1/databases/:name/tables/:table/rows/:pk` | `{column: value}` | 201 on insert, 200 on replace; `{created, pk, values, updated_at}` |
-| GET | `/v1/databases/:name/tables/:table/rows/:pk` | | |
-| DELETE | `/v1/databases/:name/tables/:table/rows/:pk` | | |
+| GET | `/v1/databases` | | `{databases: [{name, owner, node_id, ddl_version, created_at}]}` — the one database, `db` |
+| GET | `/v1/databases/db` | | that database. Any other name is 404 |
+| DELETE | `/v1/databases/:name` | | 405. The database is not dropped |
+| GET | `/v1/databases/db/tables` | | `{tables: [{name, columns, created_at}]}` |
+| POST | `/v1/databases/db/tables` | `{name, columns: [{name, type, primary?}]}` | exactly one `primary: true` column; unknown column properties are rejected |
+| GET | `/v1/databases/db/tables/:table` | | |
+| DELETE | `/v1/databases/db/tables/:table` | | |
+| GET | `/v1/databases/db/tables/:table/rows` | | `?limit=` (1-100, default 50) `&after=<pk>`; `{rows, next}` |
+| PUT | `/v1/databases/db/tables/:table/rows/:pk` | `{column: value}` | 201 on insert, 200 on replace; `{created, pk, values, updated_at}` |
+| GET | `/v1/databases/db/tables/:table/rows/:pk` | | |
+| DELETE | `/v1/databases/db/tables/:table/rows/:pk` | | |
 
-`node_id` is which physical database holds the rows. It is chosen when the account creates its first logical database and reused for the rest. `:pk` is one URL path segment (`encodeURIComponent`).
+`node_id` is which physical database holds the rows. It is chosen when the account's database is created and stays there. `:pk` is one URL path segment (`encodeURIComponent`). `POST /v1/databases` is not accepted.

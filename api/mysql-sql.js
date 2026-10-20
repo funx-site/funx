@@ -1,10 +1,10 @@
 'use strict';
-// SQL for one account's logical databases.
-// Rows stay in funx_udata. The MySQL path accepts the statements a typical
-// application sends: typed primary keys, joins, grouping, defaults, and placeholders.
+// SQL inside the one database an account is given.
+// Rows stay in funx_udata. Statements that create, drop, or switch databases are refused.
+// Table statements (CREATE, ALTER, DROP, TRUNCATE, RENAME, indexes, and DML) run here.
 // The HTTP API keeps its own stricter schema.
 
-const { cmpPk } = require('./data-store');
+const { cmpPk, ACCOUNT_DB, ensureAccountDatabase } = require('./data-store');
 
 const SERVER_VERSION = '5.7.40-funx';
 const SQL_MAX_BYTES = 4 * 1024 * 1024;
@@ -14,7 +14,7 @@ select insert update delete create drop show use primary key not null as by asc 
 right inner on if exists replace start commit rollback begin transaction describe desc columns
 databases tables variables status full schema character charset collate comment default unique index
 constraint references check auto_increment ignore replace into distinct between in is cross outer
-using having union all`.split(/\s+/));
+using having union all alter truncate rename column`.split(/\s+/));
 
 function sqlError(errno, message, sqlState = '42000') {
   return Object.assign(new Error(message), { errno, sqlState });
@@ -398,6 +398,7 @@ function parseColumnRest(p, col) {
     if (p.takeWord('unsigned')) { col.unsigned = true; continue; }
     if (p.takeWord('zerofill')) continue;
     if (p.takeWord('unique')) { col.unique = true; p.takeWord('key'); continue; }
+    if (p.word('first') || p.word('after')) return;
     if (p.takeWord('references')) { skipUntilComma(p); continue; }
     if (p.takeWord('check')) { skipUntilComma(p); continue; }
     const w = p.peek();
@@ -645,7 +646,17 @@ function parseStatement(tokens) {
       p.done();
       return { kind: 'create-database', name, ifNotExists };
     }
-    if (p.word('view') || p.word('procedure') || p.word('function') || p.word('trigger') || p.word('index')) {
+    const uniqueIndex = p.takeWord('unique');
+    if (uniqueIndex || p.word('index')) {
+      p.expectWord('index');
+      const name = parseIdent(p);
+      p.expectWord('on');
+      const table = parseIdent(p);
+      const columns = parseIndexCols(p);
+      p.done();
+      return { kind: 'create-index', unique: uniqueIndex, name, table, columns };
+    }
+    if (p.word('view') || p.word('procedure') || p.word('function') || p.word('trigger')) {
       throw sqlError(1235, `CREATE ${p.peek().v} is not supported`);
     }
     p.expectWord('table');
@@ -691,6 +702,13 @@ function parseStatement(tokens) {
 
   if (kind === 'drop') {
     p.eat();
+    if (p.takeWord('index')) {
+      const name = parseIdent(p);
+      p.expectWord('on');
+      const table = parseIdent(p);
+      p.done();
+      return { kind: 'drop-index', name, table };
+    }
     if (p.takeWord('database') || p.takeWord('schema')) {
       const ifExists = p.takeWord('if') && (p.expectWord('exists'), true);
       const name = parseIdent(p);
@@ -702,6 +720,38 @@ function parseStatement(tokens) {
     const name = parseIdent(p);
     p.done();
     return { kind: 'drop-table', name, ifExists };
+  }
+
+  if (kind === 'alter') {
+    p.eat();
+    p.expectWord('table');
+    const name = parseIdent(p);
+    const actions = [];
+    do {
+      const action = parseAlterAction(p);
+      if (action) actions.push(action);
+    } while (p.takeOp(','));
+    p.done();
+    if (!actions.length) throw sqlError(1064, 'expected a table change');
+    return { kind: 'alter-table', name, actions };
+  }
+
+  if (kind === 'truncate') {
+    p.eat();
+    p.takeWord('table');
+    const name = parseIdent(p);
+    p.done();
+    return { kind: 'truncate', name };
+  }
+
+  if (kind === 'rename') {
+    p.eat();
+    p.expectWord('table');
+    const from = parseIdent(p);
+    p.expectWord('to');
+    const to = parseIdent(p);
+    p.done();
+    return { kind: 'rename-table', from, to };
   }
 
   if (kind === 'insert' || kind === 'replace') {
@@ -816,6 +866,77 @@ function parseStatement(tokens) {
   throw sqlError(1064, `unsupported statement ${first.v}`);
 }
 
+function parseAlterColumn(p) {
+  const name = parseIdent(p);
+  const typed = parseType(p);
+  const col = {
+    name, type: typed.type, mysqlType: typed.mysqlType, primary: false,
+    nullable: true, autoIncrement: false, default: null, unsigned: false, unique: false,
+  };
+  parseColumnRest(p, col);
+  let place = null;
+  if (p.takeWord('first')) place = { first: true };
+  else if (p.takeWord('after')) place = { after: parseIdent(p) };
+  return { col, place };
+}
+
+function parseAlterAction(p) {
+  if (p.takeWord('algorithm') || p.takeWord('lock')) {
+    p.takeOp('=');
+    if (p.peek()) p.eat();
+    return null;
+  }
+  if (p.takeWord('add')) {
+    if (p.takeWord('constraint')) {
+      if (!p.word('primary') && !p.word('unique') && !p.word('foreign') && !p.word('check')) parseIdent(p);
+    }
+    if (p.takeWord('column') || (!p.word('unique') && !p.word('index') && !p.word('key') && !p.word('primary') && !p.word('fulltext') && !p.word('spatial') && !p.word('foreign') && !p.word('check'))) {
+      return { op: 'add-column', ...parseAlterColumn(p) };
+    }
+    if (p.takeWord('unique')) return { op: 'add-index', index: namedIndex(p, true) };
+    if (p.word('fulltext') || p.word('spatial')) throw sqlError(1235, 'this index type is not supported');
+    if (p.word('index') || p.word('key')) return { op: 'add-index', index: namedIndex(p, false) };
+    if (p.takeWord('primary')) {
+      p.expectWord('key');
+      parseIndexCols(p);
+      throw sqlError(1235, 'changing the primary key is not supported');
+    }
+    if (p.takeWord('foreign') || p.takeWord('check')) { skipUntilComma(p); return null; }
+    throw sqlError(1064, 'expected a column or index');
+  }
+  if (p.takeWord('drop')) {
+    if (p.takeWord('index') || p.takeWord('key')) return { op: 'drop-index', name: parseIdent(p) };
+    if (p.takeWord('primary')) {
+      p.expectWord('key');
+      throw sqlError(1235, 'dropping the primary key is not supported');
+    }
+    if (p.takeWord('foreign') || p.takeWord('check')) { parseIdent(p); return null; }
+    p.takeWord('column');
+    const name = parseIdent(p);
+    p.takeWord('restrict') || p.takeWord('cascade');
+    return { op: 'drop-column', name };
+  }
+  if (p.takeWord('rename')) {
+    if (p.takeWord('column')) {
+      const from = parseIdent(p);
+      p.expectWord('to');
+      return { op: 'rename-column', from, to: parseIdent(p) };
+    }
+    if (p.takeWord('to') || p.takeWord('as')) return { op: 'rename-table', name: parseIdent(p) };
+    throw sqlError(1064, 'expected TO');
+  }
+  if (p.takeWord('modify')) {
+    p.takeWord('column');
+    return { op: 'modify-column', ...parseAlterColumn(p) };
+  }
+  if (p.takeWord('change')) {
+    p.takeWord('column');
+    const from = parseIdent(p);
+    return { op: 'change-column', from, ...parseAlterColumn(p) };
+  }
+  throw sqlError(1064, 'unsupported ALTER TABLE');
+}
+
 function namedIndex(p, unique) {
   p.takeWord('key') || p.takeWord('index');
   let name = null;
@@ -870,14 +991,22 @@ function requireDb(session) {
   return session.database;
 }
 
+function accountSchema(schema) {
+  if (schema == null) return null;
+  if (schema === 'information_schema') return schema;
+  if (schema !== ACCOUNT_DB) throw sqlError(1049, `unknown database ${schema}`, '42000');
+  return ACCOUNT_DB;
+}
+
 const VIRTUAL = new Set(['information_schema', 'mysql', 'performance_schema', 'sys']);
 
 async function useDatabase(dataStore, session, name) {
-  if (name === 'information_schema') { session.database = name; return ok(); }
-  if (VIRTUAL.has(name)) throw sqlError(1044, `access denied for database ${name}`, '42000');
-  const db = await storeCall(() => dataStore.getDatabase(session.ownerId, name));
-  if (!db) throw sqlError(1049, `unknown database ${name}`, '42000');
-  session.database = name;
+  if (name !== ACCOUNT_DB) {
+    if (name === 'information_schema' || VIRTUAL.has(name)) throw sqlError(1044, `access denied for database ${name}`, '42000');
+    throw sqlError(1049, `unknown database ${name}`, '42000');
+  }
+  await storeCall(() => ensureAccountDatabase(dataStore, session.ownerId));
+  session.database = ACCOUNT_DB;
   return ok();
 }
 
@@ -1361,17 +1490,14 @@ function dataTypeName(c) {
 
 async function infoRows(dataStore, session, tableName) {
   const name = tableName.toLowerCase();
-  const dbs = await storeCall(() => dataStore.listDatabases(session.ownerId));
+  const dbName = ACCOUNT_DB;
+  const tables = await storeCall(() => dataStore.listTables(session.ownerId, dbName));
+  const owned = tables.map((table) => ({ db: dbName, table }));
   if (name === 'schemata') {
     return {
       columns: [col('SCHEMA_NAME', 'string'), col('CATALOG_NAME', 'string'), col('DEFAULT_CHARACTER_SET_NAME', 'string')],
-      records: dbs.map((d) => ({ values: { SCHEMA_NAME: d.name, CATALOG_NAME: 'def', DEFAULT_CHARACTER_SET_NAME: 'utf8mb4' } })),
+      records: [{ values: { SCHEMA_NAME: dbName, CATALOG_NAME: 'def', DEFAULT_CHARACTER_SET_NAME: 'utf8mb4' } }],
     };
-  }
-  const owned = [];
-  for (const d of dbs) {
-    const tables = await storeCall(() => dataStore.listTables(session.ownerId, d.name));
-    for (const t of tables) owned.push({ db: d.name, table: t });
   }
   if (name === 'tables') {
     return {
@@ -1578,18 +1704,10 @@ async function loadRef(dataStore, session, ref) {
     return { alias: ref.alias, columns: info.columns, rows: info.records.map((r) => ({ pk: '', values: r.values })) };
   }
   if (!schema) throw sqlError(1046, 'no database selected', '3D000');
-  if (VIRTUAL.has(schema)) throw sqlError(1044, `access denied for database ${schema}`, '42000');
-  const saved = session.database;
-  if (schema !== saved) {
-    const db = await storeCall(() => dataStore.getDatabase(session.ownerId, schema));
-    if (!db) throw sqlError(1049, `unknown database ${schema}`, '42000');
-    session.database = schema;
-  }
-  try {
-    const table = await loadSchema(dataStore, session, ref.name);
-    const rows = await scanTable(dataStore, session, table.name);
-    return { alias: ref.alias, table, columns: table.columns, rows };
-  } finally { session.database = saved; }
+  if (schema !== ACCOUNT_DB) throw sqlError(1049, `unknown database ${schema}`, '42000');
+  const table = await loadSchema(dataStore, session, ref.name);
+  const rows = await scanTable(dataStore, session, table.name);
+  return { alias: ref.alias, table, columns: table.columns, rows };
 }
 
 async function runSelect(dataStore, session, stmt) {
@@ -1750,6 +1868,142 @@ function columnExtra(c) {
   return c.autoIncrement ? 'auto_increment' : '';
 }
 
+function copyColumns(table) {
+  return table.columns.map((c) => ({
+    name: c.name,
+    type: c.type,
+    primary: c.primary === true,
+    nullable: c.nullable !== false,
+    autoIncrement: c.autoIncrement === true,
+    default: c.default == null ? null : c.default,
+    mysqlType: c.mysqlType || c.type,
+    unsigned: c.unsigned === true,
+  }));
+}
+
+function copyIndexes(table) {
+  return (table.indexes || []).map((ix) => ({ name: ix.name, unique: ix.unique === true, columns: ix.columns.slice() }));
+}
+
+function placeColumn(columns, col, place) {
+  if (!place) { columns.push(col); return; }
+  if (place.first) { columns.unshift(col); return; }
+  const at = columns.findIndex((c) => c.name === place.after);
+  if (at < 0) throw sqlError(1054, `unknown column ${place.after}`, '42S22');
+  columns.splice(at + 1, 0, col);
+}
+
+async function uniqueHolds(dataStore, session, tableName, index) {
+  if (!index.unique) return;
+  const rows = await storeCall(() => dataStore.listAll(session.ownerId, session.database, tableName));
+  const seen = new Set();
+  for (const row of rows) {
+    if (index.columns.some((c) => row.values[c] == null)) continue;
+    const key = JSON.stringify(index.columns.map((c) => row.values[c]));
+    if (seen.has(key)) throw sqlError(1062, 'duplicate entry', '23000');
+    seen.add(key);
+  }
+}
+
+async function saveSchema(dataStore, session, tableName, columns, indexes) {
+  await storeCall(() => dataStore.updateTable(session.ownerId, session.database, tableName, {
+    mysql: true,
+    name: tableName,
+    columns,
+    indexes,
+  }));
+}
+
+async function rewriteRows(dataStore, session, tableName, mutator) {
+  await storeCall(() => dataStore.transact(session.ownerId, session.database, async (tx) => {
+    const rows = await tx.listAll(tableName);
+    for (const row of rows) {
+      await tx.putRow(tableName, row.pk, mutator(row.values), { maxBytes: SQL_MAX_BYTES });
+    }
+  }));
+}
+
+async function applyAlter(dataStore, session, stmt) {
+  const table = await loadSchema(dataStore, session, stmt.name);
+  const columns = copyColumns(table);
+  let indexes = copyIndexes(table);
+  const added = [];
+  const dropped = [];
+  const renamed = [];
+  let renameTo = null;
+  for (const action of stmt.actions) {
+    if (action.op === 'add-column') {
+      if (columns.some((c) => c.name === action.col.name)) throw sqlError(1060, `duplicate column ${action.col.name}`, '42S21');
+      if (action.col.primary) throw sqlError(1235, 'changing the primary key is not supported');
+      if (action.col.autoIncrement && columns.some((c) => c.autoIncrement)) throw sqlError(1075, 'there can be only one auto column', '42000');
+      const rows = await storeCall(() => dataStore.listAll(session.ownerId, session.database, stmt.name));
+      if (rows.length && action.col.nullable === false && action.col.default == null && !action.col.autoIncrement) {
+        throw sqlError(1364, `field ${action.col.name} doesn't have a default value`, 'HY000');
+      }
+      if (rows.length && action.col.autoIncrement) throw sqlError(1235, 'adding AUTO_INCREMENT to a table with rows is not supported');
+      placeColumn(columns, action.col, action.place);
+      if (action.col.unique) indexes.push({ name: action.col.name, unique: true, columns: [action.col.name] });
+      added.push(action.col);
+    } else if (action.op === 'drop-column') {
+      const hit = columns.find((c) => c.name === action.name);
+      if (!hit) throw sqlError(1091, `can't DROP ${action.name}; check that column exists`, '42000');
+      if (hit.primary) throw sqlError(1235, 'dropping the primary key is not supported');
+      columns.splice(columns.indexOf(hit), 1);
+      indexes = indexes.map((ix) => ({ ...ix, columns: ix.columns.filter((c) => c !== action.name) })).filter((ix) => ix.columns.length);
+      dropped.push(action.name);
+    } else if (action.op === 'add-index') {
+      if (indexes.some((ix) => ix.name === action.index.name)) throw sqlError(1061, `duplicate key name ${action.index.name}`, '42000');
+      for (const c of action.index.columns) if (!columns.some((col) => col.name === c)) throw sqlError(1072, `key column ${c} doesn't exist`, '42000');
+      await uniqueHolds(dataStore, session, stmt.name, action.index);
+      indexes.push(action.index);
+    } else if (action.op === 'drop-index') {
+      if (!indexes.some((ix) => ix.name === action.name)) throw sqlError(1091, `can't DROP ${action.name}; check that key exists`, '42000');
+      indexes = indexes.filter((ix) => ix.name !== action.name);
+    } else if (action.op === 'rename-column' || action.op === 'modify-column' || action.op === 'change-column') {
+      const from = action.op === 'modify-column' ? action.col.name : action.from;
+      const hit = columns.find((c) => c.name === from);
+      if (!hit) throw sqlError(1054, `unknown column ${from}`, '42S22');
+      const next = action.op === 'rename-column' ? { name: action.to } : action.col;
+      if (action.op !== 'rename-column' && (hit.type !== next.type || hit.primary !== next.primary)) {
+        throw sqlError(1235, 'changing a column type is not supported');
+      }
+      if (next.name !== hit.name && columns.some((c) => c.name === next.name)) throw sqlError(1060, `duplicate column ${next.name}`, '42S21');
+      const old = hit.name;
+      if (action.op === 'rename-column') hit.name = next.name;
+      else {
+        hit.name = next.name;
+        hit.nullable = next.nullable !== false;
+        hit.default = next.default == null ? null : next.default;
+        hit.mysqlType = next.mysqlType || hit.mysqlType;
+        hit.unsigned = next.unsigned === true;
+        hit.autoIncrement = next.autoIncrement === true;
+      }
+      for (const ix of indexes) ix.columns = ix.columns.map((c) => (c === old ? hit.name : c));
+      if (old !== hit.name) renamed.push({ from: old, to: hit.name });
+    } else if (action.op === 'rename-table') {
+      renameTo = action.name;
+    }
+  }
+  await saveSchema(dataStore, session, stmt.name, columns, indexes);
+  const fill = added.filter((c) => c.default != null);
+  if (dropped.length || renamed.length || fill.length) {
+    await rewriteRows(dataStore, session, stmt.name, (values) => {
+      const next = { ...values };
+      for (const name of dropped) delete next[name];
+      for (const r of renamed) {
+        next[r.to] = next[r.from];
+        if (r.to !== r.from) delete next[r.from];
+      }
+      for (const c of fill) next[c.name] = c.default === 'current_timestamp' ? nowStamp() : coerce(c, c.default);
+      return next;
+    });
+  }
+  if (renameTo && renameTo !== stmt.name) {
+    await storeCall(() => dataStore.renameTable(session.ownerId, session.database, stmt.name, renameTo));
+  }
+  return ok();
+}
+
 async function run(dataStore, session, stmtIn) {
   const stmt = (stmtIn.kind === 'select' || stmtIn.kind === 'insert' || stmtIn.kind === 'update' || stmtIn.kind === 'delete')
     ? bindStmt(stmtIn, session) : stmtIn;
@@ -1778,37 +2032,17 @@ async function run(dataStore, session, stmtIn) {
     session.overlay = null;
     return useDatabase(dataStore, session, stmt.name);
   }
-  if (stmt.kind === 'create-database' || stmt.kind === 'drop-database' || stmt.kind === 'create-table' || stmt.kind === 'drop-table') {
+  if (stmt.kind === 'create-database' || stmt.kind === 'drop-database') {
+    throw sqlError(1044, 'access denied', '42000');
+  }
+  if (stmt.kind === 'create-table' || stmt.kind === 'drop-table' || stmt.kind === 'alter-table' || stmt.kind === 'truncate' || stmt.kind === 'rename-table' || stmt.kind === 'create-index' || stmt.kind === 'drop-index') {
     if (dirty(session)) await commitSession(dataStore, session);
     else { session.overlay = null; session.explicitTx = false; }
   }
 
-  if (stmt.kind === 'create-database') {
-    if (VIRTUAL.has(stmt.name)) throw sqlError(1044, `access denied for database ${stmt.name}`, '42000');
-    try {
-      await storeCall(() => dataStore.createDatabase({ ownerId: session.ownerId, name: stmt.name }));
-    } catch (e) {
-      if (stmt.ifNotExists && e.errno === 1050) return ok();
-      if (e.errno === 1050) throw sqlError(1007, `database ${stmt.name} already exists`, 'HY000');
-      throw e;
-    }
-    return ok();
-  }
-  if (stmt.kind === 'drop-database') {
-    if (stmt.name === session.database) session.database = null;
-    try {
-      await storeCall(() => dataStore.deleteDatabase(session.ownerId, stmt.name));
-    } catch (e) {
-      if (stmt.ifExists && (e.errno === 1146 || e.errno === 1049 || e.code === 'not_found')) return ok();
-      if (e.errno === 1146) throw sqlError(1008, `database ${stmt.name} does not exist`, 'HY000');
-      throw e;
-    }
-    return ok();
-  }
   if (stmt.kind === 'show-databases') {
-    const dbs = await storeCall(() => dataStore.listDatabases(session.ownerId));
     const re = stmt.like ? likeToRegExp(stmt.like) : null;
-    const names = dbs.map((d) => d.name).concat(['information_schema']).filter((n) => !re || re.test(n)).sort();
+    const names = [ACCOUNT_DB].filter((n) => !re || re.test(n));
     return result([col('Database', 'string')], names.map((n) => [n]));
   }
   if (stmt.kind === 'show-collation') {
@@ -1824,17 +2058,14 @@ async function run(dataStore, session, stmtIn) {
     );
   }
   if (stmt.kind === 'show-table-status') {
-    const db = stmt.schema || requireDb(session);
+    const asked = accountSchema(stmt.schema);
+    const db = asked || requireDb(session);
     const headers = ['Name', 'Engine', 'Version', 'Row_format', 'Rows', 'Avg_row_length', 'Data_length', 'Max_data_length', 'Index_length', 'Data_free', 'Auto_increment', 'Create_time', 'Update_time', 'Check_time', 'Collation', 'Checksum', 'Create_options', 'Comment'];
     const line = (n) => [n, 'InnoDB', null, 'Dynamic', null, null, null, null, null, null, null, null, null, null, 'utf8mb4_general_ci', null, '', ''];
     if (db === 'information_schema') {
       return result(headers.map((n) => col(n, 'string')), ['schemata', 'tables', 'columns', 'statistics'].map(line));
     }
-    const saved = session.database;
-    session.database = db;
-    let tables;
-    try { tables = await storeCall(() => dataStore.listTables(session.ownerId, db)); }
-    finally { session.database = saved; }
+    const tables = await storeCall(() => dataStore.listTables(session.ownerId, ACCOUNT_DB));
     const re = stmt.like ? likeToRegExp(stmt.like) : null;
     const names = tables.map((t) => t.name).filter((n) => !re || re.test(n));
     return result(headers.map((n) => col(n, 'string')), names.map(line));
@@ -1847,15 +2078,12 @@ async function run(dataStore, session, stmtIn) {
   if (stmt.kind === 'show-warnings') return result([col('Level', 'string'), col('Code', 'int'), col('Message', 'string')], []);
 
   if (stmt.kind === 'show-tables') {
-    const db = stmt.schema || requireDb(session);
+    const asked = accountSchema(stmt.schema);
+    const db = asked || requireDb(session);
     if (db === 'information_schema') {
       return result([col(`Tables_in_${db}`, 'string')], [['schemata'], ['tables'], ['columns'], ['statistics']]);
     }
-    const saved = session.database;
-    session.database = db;
-    let tables;
-    try { tables = await storeCall(() => dataStore.listTables(session.ownerId, db)); }
-    finally { session.database = saved; }
+    const tables = await storeCall(() => dataStore.listTables(session.ownerId, ACCOUNT_DB));
     const re = stmt.like ? likeToRegExp(stmt.like) : null;
     const names = tables.map((t) => t.name).filter((n) => !re || re.test(n));
     if (stmt.full) return result([col(`Tables_in_${db}`, 'string'), col('Table_type', 'string')], names.map((n) => [n, 'BASE TABLE']));
@@ -1863,10 +2091,9 @@ async function run(dataStore, session, stmtIn) {
   }
 
   if (stmt.kind === 'show-index') {
-    const saved = session.database;
-    if (stmt.schema) session.database = stmt.schema;
-    try {
-      const table = await loadSchema(dataStore, session, stmt.name);
+    const asked = accountSchema(stmt.schema);
+    if (asked === 'information_schema') throw sqlError(1044, 'access denied for database information_schema', '42000');
+    const table = await loadSchema(dataStore, session, stmt.name);
       const headers = ['Table', 'Non_unique', 'Key_name', 'Seq_in_index', 'Column_name', 'Collation', 'Cardinality', 'Sub_part', 'Packed', 'Null', 'Index_type', 'Comment', 'Index_comment'];
       const lines = [];
       const pk = table.columns.find((c) => c.primary);
@@ -1874,14 +2101,12 @@ async function run(dataStore, session, stmtIn) {
       if (pk) push('PRIMARY', true, pk.name, 1);
       for (const ix of table.indexes || []) ix.columns.forEach((c, i) => push(ix.name, ix.unique, c, i + 1));
       return result(headers.map((n, i) => col(n, i === 1 || i === 3 ? 'int' : 'string')), lines);
-    } finally { session.database = saved; }
   }
 
   if (stmt.kind === 'show-columns' || stmt.kind === 'show-create') {
-    const saved = session.database;
-    if (stmt.schema) session.database = stmt.schema;
-    try {
-      const table = await loadSchema(dataStore, session, stmt.name);
+    const asked = accountSchema(stmt.schema);
+    if (asked === 'information_schema') throw sqlError(1044, 'access denied for database information_schema', '42000');
+    const table = await loadSchema(dataStore, session, stmt.name);
       if (stmt.kind === 'show-create') {
         const body = table.columns.map((c) => {
           const bits = [`  \`${c.name}\` ${columnTypeSql(c)}`];
@@ -1905,7 +2130,6 @@ async function run(dataStore, session, stmtIn) {
         ? ['Field', 'Type', 'Collation', 'Null', 'Key', 'Default', 'Extra', 'Comment'].map((n) => col(n, 'string'))
         : ['Field', 'Type', 'Null', 'Key', 'Default', 'Extra'].map((n) => col(n, 'string'));
       return result(columns, rows);
-    } finally { session.database = saved; }
   }
 
   if (stmt.kind === 'create-table') {
@@ -1951,6 +2175,41 @@ async function run(dataStore, session, stmtIn) {
       if (stmt.ifExists && e.errno === 1146) return ok();
       throw e;
     }
+    return ok();
+  }
+
+  if (stmt.kind === 'alter-table') return applyAlter(dataStore, session, stmt);
+
+  if (stmt.kind === 'create-index' || stmt.kind === 'drop-index') {
+    const table = await loadSchema(dataStore, session, stmt.table);
+    const columns = copyColumns(table);
+    let indexes = copyIndexes(table);
+    if (stmt.kind === 'create-index') {
+      if (indexes.some((ix) => ix.name === stmt.name)) throw sqlError(1061, `duplicate key name ${stmt.name}`, '42000');
+      for (const c of stmt.columns) if (!columns.some((col) => col.name === c)) throw sqlError(1072, `key column ${c} doesn't exist`, '42000');
+      const index = { name: stmt.name, unique: stmt.unique === true, columns: stmt.columns };
+      await uniqueHolds(dataStore, session, stmt.table, index);
+      indexes.push(index);
+    } else {
+      if (!indexes.some((ix) => ix.name === stmt.name)) throw sqlError(1091, `can't DROP ${stmt.name}; check that key exists`, '42000');
+      indexes = indexes.filter((ix) => ix.name !== stmt.name);
+    }
+    await saveSchema(dataStore, session, stmt.table, columns, indexes);
+    return ok();
+  }
+
+  if (stmt.kind === 'truncate') {
+    const table = await loadSchema(dataStore, session, stmt.name);
+    await storeCall(() => dataStore.transact(session.ownerId, session.database, async (tx) => {
+      const rows = await tx.listAll(stmt.name);
+      for (const row of rows) await tx.deleteRow(stmt.name, row.pk);
+      if (table.columns.some((c) => c.autoIncrement)) await tx.setMeta(stmt.name, { ai: 1 });
+    }));
+    return ok();
+  }
+
+  if (stmt.kind === 'rename-table') {
+    await storeCall(() => dataStore.renameTable(session.ownerId, requireDb(session), stmt.from, stmt.to));
     return ok();
   }
 
@@ -2027,7 +2286,13 @@ async function run(dataStore, session, stmtIn) {
   throw sqlError(1064, 'unsupported statement');
 }
 
+async function enterAccount(dataStore, session) {
+  await storeCall(() => ensureAccountDatabase(dataStore, session.ownerId));
+  if (!session.database) session.database = ACCOUNT_DB;
+}
+
 async function forEachStatement(dataStore, session, sql, onResult) {
+  await enterAccount(dataStore, session);
   const parts = splitStatements(String(sql));
   if (!parts.length) throw sqlError(1064, 'empty statement');
   for (let i = 0; i < parts.length; i++) {

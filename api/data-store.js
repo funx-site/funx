@@ -23,6 +23,10 @@ const LIMITS = Object.freeze({
   pkChars: 255,
 });
 
+// The account-facing product is this one database. The catalog can still hold others
+// (the platform database). Callers do not create or drop it.
+const ACCOUNT_DB = 'db';
+
 const IDENT = /^[a-z][a-z0-9_]{0,63}$/;
 const TYPES = new Set(['string', 'int', 'bool', 'json']);
 const RICH_TYPES = new Set(['string', 'int', 'bool', 'json', 'float', 'decimal', 'datetime', 'blob']);
@@ -569,6 +573,30 @@ class MemoryDataStore {
     return { deleted: tableName };
   }
 
+  async updateTable(ownerId, dbName, tableName, spec) {
+    const { db, table } = this._requireTable(ownerId, dbName, tableName);
+    const columns = spec.mysql ? normalizeRich(spec, this.limits) : normalizeColumns(spec.columns, this.limits);
+    table.columns_json = columns;
+    const schema = schemaOf(columns);
+    if (spec.mysql && (schema.columns.some((c) => c.autoIncrement) || schema.indexes.some((ix) => ix.unique))) {
+      const bucket = this._bucket(db.node_id, db.id, table.id, true);
+      if (!bucket.has(SENTINEL_PK)) bucket.set(SENTINEL_PK, { doc: { ai: 1 }, updated_at: new Date() });
+    }
+    db.ddl_version += 1;
+    return publicTable(table);
+  }
+
+  async renameTable(ownerId, dbName, from, to) {
+    const { db, table } = this._requireTable(ownerId, dbName, from);
+    checkIdent(to, 'table name');
+    if (from !== to) {
+      if (this._table(db, to)) throw dataError('exists', `table ${to} already exists`);
+      table.name = to;
+      db.ddl_version += 1;
+    }
+    return publicTable(table);
+  }
+
   async getRow(ownerId, dbName, tableName, pkRaw) {
     const { db, table } = this._requireTable(ownerId, dbName, tableName);
     const columns = columnsOf(table.columns_json);
@@ -864,6 +892,35 @@ class MysqlDataStore {
     return { deleted: tableName };
   }
 
+  async updateTable(ownerId, dbName, tableName, spec) {
+    const { db, table } = await this._requireTable(ownerId, dbName, tableName);
+    const columns = spec.mysql ? normalizeRich(spec, this.limits) : normalizeColumns(spec.columns, this.limits);
+    await this.q(this.catalog, 'UPDATE funx_utbl SET columns_json = ? WHERE id = ?', [columns, table.id]);
+    await this.q(this.catalog, 'UPDATE funx_udb SET ddl_version = ddl_version + 1 WHERE id = ?', [db.id]);
+    const schema = schemaOf(columns);
+    if (spec.mysql && (schema.columns.some((c) => c.autoIncrement) || schema.indexes.some((ix) => ix.unique))) {
+      try {
+        await this.q(this._pool(db.node_id), 'INSERT INTO funx_udata (udb_id, utbl_id, pk, doc) VALUES (?, ?, ?, ?)', [db.id, table.id, SENTINEL_PK, { ai: 1 }]);
+      } catch (e) {
+        if (!e || e.code !== 'ER_DUP_ENTRY') throw e;
+      }
+    }
+    const fresh = await this._loadTable(db, tableName);
+    return publicTable(fresh);
+  }
+
+  async renameTable(ownerId, dbName, from, to) {
+    const { db, table } = await this._requireTable(ownerId, dbName, from);
+    checkIdent(to, 'table name');
+    if (from !== to) {
+      if (await this._loadTable(db, to)) throw dataError('exists', `table ${to} already exists`);
+      await this.q(this.catalog, 'UPDATE funx_utbl SET name = ? WHERE id = ?', [to, table.id]);
+      await this.q(this.catalog, 'UPDATE funx_udb SET ddl_version = ddl_version + 1 WHERE id = ?', [db.id]);
+    }
+    const fresh = await this._loadTable(db, to);
+    return publicTable(fresh);
+  }
+
   _qdata(db) {
     const pool = this._pool(db.node_id);
     return (sql, params) => this.q(pool, sql, params);
@@ -1003,7 +1060,18 @@ async function udataList(q, db, table, { limit, after, prefix } = {}, max) {
   return pageRows(rows.filter((r) => !isSentinel(r.pk)).map((r) => decodeRow(columns, r.pk, r.doc, r.updated_at)), n);
 }
 
+async function ensureAccountDatabase(dataStore, ownerId) {
+  const existing = await dataStore.getDatabase(ownerId, ACCOUNT_DB);
+  if (existing) return existing;
+  try {
+    return await dataStore.createDatabase({ ownerId, name: ACCOUNT_DB });
+  } catch (e) {
+    if (e && e.code === 'exists') return dataStore.getDatabase(ownerId, ACCOUNT_DB);
+    throw e;
+  }
+}
+
 module.exports = {
-  LIMITS, DATA_MIGRATIONS, UDATA_SQL, MemoryDataStore, MysqlDataStore,
-  dataError, placeNode, chooseNode, cmpPk,
+  LIMITS, ACCOUNT_DB, DATA_MIGRATIONS, UDATA_SQL, MemoryDataStore, MysqlDataStore,
+  dataError, placeNode, chooseNode, cmpPk, ensureAccountDatabase,
 };

@@ -2,7 +2,7 @@
 // HTTP for logical databases. Mounted only when funx-api was given a data store.
 // Accounts see their own rows. A missing name and someone else's name are both 404.
 
-const { dataError } = require('./data-store');
+const { dataError, ACCOUNT_DB, ensureAccountDatabase } = require('./data-store');
 const { PLATFORM_OWNER } = require('./platform-data');
 
 const STATUS = {
@@ -36,19 +36,20 @@ async function handleDatabases({ dataStore, user, method, parts, body, query, Ht
 async function dispatch({ dataStore, user, method, parts, body, query, HttpError }) {
   const ownerId = user.id;
   if (!parts.length) {
-    if (method === 'GET') return [200, { databases: await dataStore.listDatabases(ownerId) }];
-    if (method === 'POST') return [201, await dataStore.createDatabase({ ownerId, name: body.name })];
+    if (method === 'GET') {
+      const db = await ensureAccountDatabase(dataStore, ownerId);
+      return [200, { databases: [db] }];
+    }
     throw new HttpError(405, 'method_not_allowed');
   }
 
   const name = parts[0];
+  if (name !== ACCOUNT_DB) {
+    if (parts.length === 1 && method === 'DELETE') throw new HttpError(405, 'method_not_allowed');
+    throw dataError('not_found', `no database named ${name}`);
+  }
   if (parts.length === 1) {
-    if (method === 'GET') {
-      const db = await dataStore.getDatabase(ownerId, name);
-      if (!db) throw dataError('not_found', `no database named ${name}`);
-      return [200, db];
-    }
-    if (method === 'DELETE') return [200, await dataStore.deleteDatabase(ownerId, name)];
+    if (method === 'GET') return [200, await ensureAccountDatabase(dataStore, ownerId)];
     throw new HttpError(405, 'method_not_allowed');
   }
 

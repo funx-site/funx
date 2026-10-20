@@ -87,6 +87,16 @@ function fakeDataPool() {
       state.funx_utbl = state.funx_utbl.filter((r) => r.id !== params[0]);
       return [{ affectedRows: before - state.funx_utbl.length }];
     }
+    if (s.startsWith('UPDATE funx_utbl SET columns_json = ? WHERE id = ?')) {
+      const row = state.funx_utbl.find((r) => r.id === params[1]);
+      if (row) row.columns_json = JSON.parse(JSON.stringify(params[0]));
+      return [{ affectedRows: row ? 1 : 0 }];
+    }
+    if (s.startsWith('UPDATE funx_utbl SET name = ? WHERE id = ?')) {
+      const row = state.funx_utbl.find((r) => r.id === params[1]);
+      if (row) row.name = params[0];
+      return [{ affectedRows: row ? 1 : 0 }];
+    }
     const lim = s.match(/ LIMIT (\d+)$/);
     if (lim && s.startsWith('SELECT pk, doc, updated_at FROM funx_udata') && s.includes('ORDER BY pk LIMIT')) {
       const n = Number(lim[1]);
