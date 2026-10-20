@@ -1,8 +1,8 @@
 # Logical databases
 
-An account is given one database, named `db`. That does not create a MySQL database, a user, or a machine. Funx keeps a fixed set of physical databases (one today) and stores every user row in a single table. The account does not create, drop, or switch databases. Table statements run inside `db`.
+An account creates a project and gives it a name. That name is the database. It is unique for that account. Another account can use the same name. Creating the project does not create a MySQL database, a user, or a machine. Funx keeps a fixed set of physical databases (one today) and stores every user row in a single table. SQL cannot create or drop a database. Table statements run inside the project the client selected.
 
-This is not `env.DB` and not a D1 binding. Worker code does not receive a database handle. An account connects the way it would connect to any other cloud MySQL: host, port, user, password, and the database name `db`. Those statements read and write the same `funx_udata` rows as the HTTP API. The database is one catalog row. It does not create a physical database.
+This is not `env.DB` and not a D1 binding. Worker code does not receive a database handle. An account connects the way it would connect to any other cloud MySQL: host, port, user, password, and the project name as the database. Those statements read and write the same `funx_udata` rows as the HTTP API. Creating a project is still one catalog row. It does not create a physical database.
 
 The MySQL listener is a TCP port on the API process (`FUNX_MYSQL_PORT`, bound on `0.0.0.0`). The host printed in connection strings is `FUNX_MYSQL_HOST` (default `127.0.0.1`). SCF Web functions only accept HTTP on `:9000`, so that HTTP port is not the MySQL port. Turn the listener on where the process can accept TCP. The wire protocol is MySQL with `mysql_native_password`, including prepared statements. TLS is offered when the client asks; set `FUNX_MYSQL_TLS_CERT` and `FUNX_MYSQL_TLS_KEY`, or the process generates a self-signed certificate. See [API.md](API.md) for the SQL that works and the parts that answer with an error.
 
@@ -48,7 +48,7 @@ Existing logical databases keep their `node_id` and stay on the old pool. New ac
 
 ## Limits
 
-32 is the catalog ceiling per account. The account-facing API gives each account one database, `db`, and does not accept a second. 64 tables per database, 128 columns per table, 100 rows per list call. The HTTP API caps a row at 32 KB and accepts only `name`, `type`, and `primary` on a column. The MySQL path caps a row at 4 MB and stores defaults, nullability, auto-increment, and indexes in `columns_json`. Non-unique indexes are metadata for `SHOW INDEX`; a `UNIQUE` index is enforced. `ALTER TABLE`, `TRUNCATE`, `RENAME TABLE`, and `CREATE`/`DROP INDEX` change that schema. They do not create another database.
+32 projects per account, 64 tables per database, 128 columns per table, 100 rows per list call. The HTTP API caps a row at 32 KB and accepts only `name`, `type`, and `primary` on a column. The MySQL path caps a row at 4 MB and stores defaults, nullability, auto-increment, and indexes in `columns_json`. Non-unique indexes are metadata for `SHOW INDEX`; a `UNIQUE` index is enforced. `ALTER TABLE`, `TRUNCATE`, `RENAME TABLE`, and `CREATE`/`DROP INDEX` change that schema. `CREATE DATABASE` and `DROP DATABASE` are refused; the project is created over HTTP.
 
 ## Platform database
 
@@ -64,7 +64,7 @@ Funx's own accounts, setup tokens, workers, versions and bindings are rows in th
 | `worker_bindings` | `<name>@<KEY>` | a var, or a sealed secret |
 | `mysql_accounts` | MySQL user name | the account id and the `mysql_native_password` hash |
 
-`GET /v1/mysql` returns the host, port, user and the database name `db`. `POST /v1/mysql` rotates the password and returns it once. The platform owner `funx` has no MySQL login. `CREATE DATABASE`, `DROP DATABASE`, and `USE` of any other name are refused.
+`GET /v1/mysql` returns the host, port, user and the project names. When the account has one project, `database` and `uri` use that name. `POST /v1/mysql` rotates the password and returns it once. The platform owner `funx` has no MySQL login. `CREATE DATABASE` and `DROP DATABASE` are refused. `USE` only opens a project this account created.
 
 A worker name is `a-z`, `0-9` and `-`, so it never contains `@`. A prefix scan of `<name>@` stays on that worker's range of the clustered index.
 

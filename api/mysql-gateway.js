@@ -1,6 +1,7 @@
 'use strict';
-// MySQL text protocol in front of the one database an account is given.
-// A client connects with host, port, user and password. The session is already in `db`.
+// MySQL text protocol in front of the databases an account created.
+// Each database name is the project name: unique for that account, reusable by another account.
+// A client connects with host, port, user, password, and that name.
 // The bytes land in funx_udata. This does not open a physical database per account.
 //
 // SCF Web functions only accept HTTP on :9000, so this listener is separate.
@@ -15,7 +16,6 @@ const path = require('path');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const { verifyMysqlUser } = require('./mysql-auth');
-const { ACCOUNT_DB, ensureAccountDatabase } = require('./data-store');
 const { forEachStatement, newSession, sqlError, SERVER_VERSION, splitStatements } = require('./mysql-sql');
 
 const MAX_PACKET = 0xffffff;
@@ -562,7 +562,7 @@ async function commandLoop(socket, reader, dataStore, session, flags) {
       continue;
     }
     if (cmd === COM_RESET) {
-      session.database = ACCOUNT_DB;
+      session.database = null;
       session.autocommit = true;
       session.explicitTx = false;
       session.overlay = null;
@@ -690,17 +690,16 @@ async function handleSocket(rawSocket, dataStore, throttle) {
       await sendErr(socket, seq, 1045, `Access denied for user '${client.user}'@'${host}' (using password: ${using})`, '28000');
       return;
     }
-    const session = newSession({ ownerId: auth.ownerId, username: auth.username, database: ACCOUNT_DB });
+    const session = newSession({ ownerId: auth.ownerId, username: auth.username });
     session.connectionId = connId;
-    if (client.database && client.database.toLowerCase() !== ACCOUNT_DB) {
-      await sendErr(socket, seq, 1049, `unknown database ${client.database}`, '42000');
-      return;
-    }
-    try {
-      await ensureAccountDatabase(dataStore, auth.ownerId);
-    } catch (e) {
-      await sendErr(socket, seq, 1105, e && e.message ? e.message : 'internal error', 'HY000');
-      return;
+    if (client.database) {
+      try {
+        await forEachStatement(dataStore, session, `USE ${quoteIdent(client.database)}`, async () => {});
+      } catch (e) {
+        const err = e && e.errno ? e : sqlError(1049, `unknown database ${client.database}`, '42000');
+        await sendErr(socket, seq, err.errno, err.message, err.sqlState);
+        return;
+      }
     }
     await send(socket, seq, okPacket(session, 0, false));
     await commandLoop(socket, reader, dataStore, session, client.flags);

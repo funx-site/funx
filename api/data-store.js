@@ -23,10 +23,6 @@ const LIMITS = Object.freeze({
   pkChars: 255,
 });
 
-// The account-facing product is this one database. The catalog can still hold others
-// (the platform database). Callers do not create or drop it.
-const ACCOUNT_DB = 'db';
-
 const IDENT = /^[a-z][a-z0-9_]{0,63}$/;
 const TYPES = new Set(['string', 'int', 'bool', 'json']);
 const RICH_TYPES = new Set(['string', 'int', 'bool', 'json', 'float', 'decimal', 'datetime', 'blob']);
@@ -1060,18 +1056,7 @@ async function udataList(q, db, table, { limit, after, prefix } = {}, max) {
   return pageRows(rows.filter((r) => !isSentinel(r.pk)).map((r) => decodeRow(columns, r.pk, r.doc, r.updated_at)), n);
 }
 
-async function ensureAccountDatabase(dataStore, ownerId) {
-  const existing = await dataStore.getDatabase(ownerId, ACCOUNT_DB);
-  if (existing) return existing;
-  try {
-    return await dataStore.createDatabase({ ownerId, name: ACCOUNT_DB });
-  } catch (e) {
-    if (e && e.code === 'exists') return dataStore.getDatabase(ownerId, ACCOUNT_DB);
-    throw e;
-  }
-}
-
 module.exports = {
-  LIMITS, ACCOUNT_DB, DATA_MIGRATIONS, UDATA_SQL, MemoryDataStore, MysqlDataStore,
-  dataError, placeNode, chooseNode, cmpPk, ensureAccountDatabase,
+  LIMITS, DATA_MIGRATIONS, UDATA_SQL, MemoryDataStore, MysqlDataStore,
+  dataError, placeNode, chooseNode, cmpPk,
 };

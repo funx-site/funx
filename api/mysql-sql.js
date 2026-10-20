@@ -1,10 +1,10 @@
 'use strict';
-// SQL inside the one database an account is given.
-// Rows stay in funx_udata. Statements that create, drop, or switch databases are refused.
-// Table statements (CREATE, ALTER, DROP, TRUNCATE, RENAME, indexes, and DML) run here.
-// The HTTP API keeps its own stricter schema.
+// SQL inside a database the account created.
+// The database name is the project name. It is unique for that account and may
+// match another account's project. CREATE DATABASE and DROP DATABASE are refused.
+// Table statements run in the selected database. Rows stay in funx_udata.
 
-const { cmpPk, ACCOUNT_DB, ensureAccountDatabase } = require('./data-store');
+const { cmpPk } = require('./data-store');
 
 const SERVER_VERSION = '5.7.40-funx';
 const SQL_MAX_BYTES = 4 * 1024 * 1024;
@@ -991,22 +991,20 @@ function requireDb(session) {
   return session.database;
 }
 
-function accountSchema(schema) {
-  if (schema == null) return null;
-  if (schema === 'information_schema') return schema;
-  if (schema !== ACCOUNT_DB) throw sqlError(1049, `unknown database ${schema}`, '42000');
-  return ACCOUNT_DB;
-}
-
 const VIRTUAL = new Set(['information_schema', 'mysql', 'performance_schema', 'sys']);
 
+async function resolveOwned(dataStore, session, name) {
+  if (name === 'information_schema') return name;
+  if (VIRTUAL.has(name)) throw sqlError(1044, `access denied for database ${name}`, '42000');
+  const db = await storeCall(() => dataStore.getDatabase(session.ownerId, name));
+  if (!db) throw sqlError(1049, `unknown database ${name}`, '42000');
+  return name;
+}
+
 async function useDatabase(dataStore, session, name) {
-  if (name !== ACCOUNT_DB) {
-    if (name === 'information_schema' || VIRTUAL.has(name)) throw sqlError(1044, `access denied for database ${name}`, '42000');
-    throw sqlError(1049, `unknown database ${name}`, '42000');
-  }
-  await storeCall(() => ensureAccountDatabase(dataStore, session.ownerId));
-  session.database = ACCOUNT_DB;
+  if (name === 'information_schema' || VIRTUAL.has(name)) throw sqlError(1044, `access denied for database ${name}`, '42000');
+  await resolveOwned(dataStore, session, name);
+  session.database = name;
   return ok();
 }
 
@@ -1490,14 +1488,17 @@ function dataTypeName(c) {
 
 async function infoRows(dataStore, session, tableName) {
   const name = tableName.toLowerCase();
-  const dbName = ACCOUNT_DB;
-  const tables = await storeCall(() => dataStore.listTables(session.ownerId, dbName));
-  const owned = tables.map((table) => ({ db: dbName, table }));
+  const dbs = await storeCall(() => dataStore.listDatabases(session.ownerId));
   if (name === 'schemata') {
     return {
       columns: [col('SCHEMA_NAME', 'string'), col('CATALOG_NAME', 'string'), col('DEFAULT_CHARACTER_SET_NAME', 'string')],
-      records: [{ values: { SCHEMA_NAME: dbName, CATALOG_NAME: 'def', DEFAULT_CHARACTER_SET_NAME: 'utf8mb4' } }],
+      records: dbs.map((d) => ({ values: { SCHEMA_NAME: d.name, CATALOG_NAME: 'def', DEFAULT_CHARACTER_SET_NAME: 'utf8mb4' } })),
     };
+  }
+  const owned = [];
+  for (const d of dbs) {
+    const tables = await storeCall(() => dataStore.listTables(session.ownerId, d.name));
+    for (const table of tables) owned.push({ db: d.name, table });
   }
   if (name === 'tables') {
     return {
@@ -1704,10 +1705,17 @@ async function loadRef(dataStore, session, ref) {
     return { alias: ref.alias, columns: info.columns, rows: info.records.map((r) => ({ pk: '', values: r.values })) };
   }
   if (!schema) throw sqlError(1046, 'no database selected', '3D000');
-  if (schema !== ACCOUNT_DB) throw sqlError(1049, `unknown database ${schema}`, '42000');
-  const table = await loadSchema(dataStore, session, ref.name);
-  const rows = await scanTable(dataStore, session, table.name);
-  return { alias: ref.alias, table, columns: table.columns, rows };
+  if (VIRTUAL.has(schema)) throw sqlError(1044, `access denied for database ${schema}`, '42000');
+  const saved = session.database;
+  if (schema !== saved) {
+    await resolveOwned(dataStore, session, schema);
+    session.database = schema;
+  }
+  try {
+    const table = await loadSchema(dataStore, session, ref.name);
+    const rows = await scanTable(dataStore, session, table.name);
+    return { alias: ref.alias, table, columns: table.columns, rows };
+  } finally { session.database = saved; }
 }
 
 async function runSelect(dataStore, session, stmt) {
@@ -2041,8 +2049,9 @@ async function run(dataStore, session, stmtIn) {
   }
 
   if (stmt.kind === 'show-databases') {
+    const dbs = await storeCall(() => dataStore.listDatabases(session.ownerId));
     const re = stmt.like ? likeToRegExp(stmt.like) : null;
-    const names = [ACCOUNT_DB].filter((n) => !re || re.test(n));
+    const names = dbs.map((d) => d.name).filter((n) => !re || re.test(n)).sort();
     return result([col('Database', 'string')], names.map((n) => [n]));
   }
   if (stmt.kind === 'show-collation') {
@@ -2058,14 +2067,13 @@ async function run(dataStore, session, stmtIn) {
     );
   }
   if (stmt.kind === 'show-table-status') {
-    const asked = accountSchema(stmt.schema);
-    const db = asked || requireDb(session);
+    const db = stmt.schema ? await resolveOwned(dataStore, session, stmt.schema) : requireDb(session);
     const headers = ['Name', 'Engine', 'Version', 'Row_format', 'Rows', 'Avg_row_length', 'Data_length', 'Max_data_length', 'Index_length', 'Data_free', 'Auto_increment', 'Create_time', 'Update_time', 'Check_time', 'Collation', 'Checksum', 'Create_options', 'Comment'];
     const line = (n) => [n, 'InnoDB', null, 'Dynamic', null, null, null, null, null, null, null, null, null, null, 'utf8mb4_general_ci', null, '', ''];
     if (db === 'information_schema') {
       return result(headers.map((n) => col(n, 'string')), ['schemata', 'tables', 'columns', 'statistics'].map(line));
     }
-    const tables = await storeCall(() => dataStore.listTables(session.ownerId, ACCOUNT_DB));
+    const tables = await storeCall(() => dataStore.listTables(session.ownerId, db));
     const re = stmt.like ? likeToRegExp(stmt.like) : null;
     const names = tables.map((t) => t.name).filter((n) => !re || re.test(n));
     return result(headers.map((n) => col(n, 'string')), names.map(line));
@@ -2078,12 +2086,11 @@ async function run(dataStore, session, stmtIn) {
   if (stmt.kind === 'show-warnings') return result([col('Level', 'string'), col('Code', 'int'), col('Message', 'string')], []);
 
   if (stmt.kind === 'show-tables') {
-    const asked = accountSchema(stmt.schema);
-    const db = asked || requireDb(session);
+    const db = stmt.schema ? await resolveOwned(dataStore, session, stmt.schema) : requireDb(session);
     if (db === 'information_schema') {
       return result([col(`Tables_in_${db}`, 'string')], [['schemata'], ['tables'], ['columns'], ['statistics']]);
     }
-    const tables = await storeCall(() => dataStore.listTables(session.ownerId, ACCOUNT_DB));
+    const tables = await storeCall(() => dataStore.listTables(session.ownerId, db));
     const re = stmt.like ? likeToRegExp(stmt.like) : null;
     const names = tables.map((t) => t.name).filter((n) => !re || re.test(n));
     if (stmt.full) return result([col(`Tables_in_${db}`, 'string'), col('Table_type', 'string')], names.map((n) => [n, 'BASE TABLE']));
@@ -2091,8 +2098,11 @@ async function run(dataStore, session, stmtIn) {
   }
 
   if (stmt.kind === 'show-index') {
-    const asked = accountSchema(stmt.schema);
-    if (asked === 'information_schema') throw sqlError(1044, 'access denied for database information_schema', '42000');
+    const db = stmt.schema ? await resolveOwned(dataStore, session, stmt.schema) : requireDb(session);
+    if (db === 'information_schema') throw sqlError(1044, 'access denied for database information_schema', '42000');
+    const saved = session.database;
+    session.database = db;
+    try {
     const table = await loadSchema(dataStore, session, stmt.name);
       const headers = ['Table', 'Non_unique', 'Key_name', 'Seq_in_index', 'Column_name', 'Collation', 'Cardinality', 'Sub_part', 'Packed', 'Null', 'Index_type', 'Comment', 'Index_comment'];
       const lines = [];
@@ -2101,11 +2111,15 @@ async function run(dataStore, session, stmtIn) {
       if (pk) push('PRIMARY', true, pk.name, 1);
       for (const ix of table.indexes || []) ix.columns.forEach((c, i) => push(ix.name, ix.unique, c, i + 1));
       return result(headers.map((n, i) => col(n, i === 1 || i === 3 ? 'int' : 'string')), lines);
+    } finally { session.database = saved; }
   }
 
   if (stmt.kind === 'show-columns' || stmt.kind === 'show-create') {
-    const asked = accountSchema(stmt.schema);
-    if (asked === 'information_schema') throw sqlError(1044, 'access denied for database information_schema', '42000');
+    const db = stmt.schema ? await resolveOwned(dataStore, session, stmt.schema) : requireDb(session);
+    if (db === 'information_schema') throw sqlError(1044, 'access denied for database information_schema', '42000');
+    const saved = session.database;
+    session.database = db;
+    try {
     const table = await loadSchema(dataStore, session, stmt.name);
       if (stmt.kind === 'show-create') {
         const body = table.columns.map((c) => {
@@ -2130,6 +2144,7 @@ async function run(dataStore, session, stmtIn) {
         ? ['Field', 'Type', 'Collation', 'Null', 'Key', 'Default', 'Extra', 'Comment'].map((n) => col(n, 'string'))
         : ['Field', 'Type', 'Null', 'Key', 'Default', 'Extra'].map((n) => col(n, 'string'));
       return result(columns, rows);
+    } finally { session.database = saved; }
   }
 
   if (stmt.kind === 'create-table') {
@@ -2287,8 +2302,8 @@ async function run(dataStore, session, stmtIn) {
 }
 
 async function enterAccount(dataStore, session) {
-  await storeCall(() => ensureAccountDatabase(dataStore, session.ownerId));
-  if (!session.database) session.database = ACCOUNT_DB;
+  if (!session.database) return;
+  await resolveOwned(dataStore, session, session.database);
 }
 
 async function forEachStatement(dataStore, session, sql, onResult) {

@@ -25,9 +25,11 @@ async function sql(store, ownerId, text, database) {
 test('sql: create, read, update, delete, and the session transaction', async () => {
   const store = new MemoryDataStore();
   const s = session('u1');
-  await assert.rejects(executeSql(store, s, 'CREATE DATABASE app'), (e) => e.errno === 1044);
-  await assert.rejects(executeSql(store, s, 'DROP DATABASE db'), (e) => e.errno === 1044);
-  assert.equal(s.database, 'db');
+  await store.createDatabase({ ownerId: 'u1', name: 'app' });
+  s.database = 'app';
+  await assert.rejects(executeSql(store, s, 'CREATE DATABASE other'), (e) => e.errno === 1044);
+  await assert.rejects(executeSql(store, s, 'DROP DATABASE app'), (e) => e.errno === 1044);
+  assert.equal(s.database, 'app');
   await executeSql(store, s, 'CREATE TABLE notes (id VARCHAR(64) PRIMARY KEY, title VARCHAR(255), n INT, done BOOL, meta JSON)');
   await executeSql(store, s, "INSERT INTO notes (id, title, n, done, meta) VALUES ('a', 'hi', 2, true, '{\"x\":1}')");
   const rows = await executeSql(store, s, 'SELECT id, title, n, done, meta FROM notes WHERE title = \'hi\'');
@@ -50,7 +52,7 @@ test('sql: create, read, update, delete, and the session transaction', async () 
   assert.deepEqual((await executeSql(store, s, 'SELECT COUNT(*) AS n FROM posts'))[0].rows, [[1]]);
   await executeSql(store, s, "INSERT INTO notes (id, title) VALUES ('wide', '" + 'x'.repeat(40000) + "')");
   assert.equal((await executeSql(store, s, "SELECT id FROM notes WHERE id = 'wide'"))[0].rows.length, 1);
-  await assert.rejects(sql(store, 'u1', "INSERT INTO notes (id, title) VALUES ('huge', '" + 'x'.repeat(4 * 1024 * 1024) + "')"), (e) => e.errno === 1406);
+  await assert.rejects(sql(store, 'u1', "INSERT INTO notes (id, title) VALUES ('huge', '" + 'x'.repeat(4 * 1024 * 1024) + "')", 'app'), (e) => e.errno === 1406);
   await executeSql(store, s, "ALTER TABLE notes ADD COLUMN extra VARCHAR(16) NOT NULL DEFAULT 'z'");
   assert.deepEqual((await executeSql(store, s, "SELECT extra FROM notes WHERE id = 'wide'"))[0].rows, [['z']]);
   await executeSql(store, s, 'CREATE INDEX extra ON notes (extra)');
@@ -61,11 +63,15 @@ test('sql: create, read, update, delete, and the session transaction', async () 
   await executeSql(store, s, 'RENAME TABLE posts TO entries');
   const names = (await executeSql(store, s, 'SHOW TABLES'))[0].rows.map((r) => r[0]).sort();
   assert.deepEqual(names, ['entries', 'notes', 'users']);
-  const other = await executeSql(store, session('u2'), 'SHOW DATABASES');
-  assert.deepEqual(other[0].rows, [['db']]);
-  await assert.rejects(executeSql(store, session('u2'), 'USE app'), (e) => e.errno === 1049);
-  assert.deepEqual((await executeSql(store, session('u2'), 'SHOW TABLES'))[0].rows, []);
-  await assert.rejects(executeSql(store, s, 'SELECT id FROM app.notes'), (e) => e.errno === 1049);
+  const otherSession = session('u2');
+  await store.createDatabase({ ownerId: 'u2', name: 'app' });
+  otherSession.database = 'app';
+  const other = await executeSql(store, otherSession, 'SHOW DATABASES');
+  assert.deepEqual(other[0].rows, [['app']]);
+  assert.deepEqual((await executeSql(store, otherSession, 'SHOW TABLES'))[0].rows, []);
+  await assert.rejects(executeSql(store, otherSession, 'USE nope'), (e) => e.errno === 1049);
+  assert.ok((await executeSql(store, s, 'SHOW TABLES'))[0].rows.map((r) => r[0]).includes('notes'));
+  await assert.rejects(executeSql(store, s, 'SELECT id FROM nope.notes'), (e) => e.errno === 1049);
 });
 
 function clientOpts(port, user, password, extra = {}) {
@@ -80,6 +86,8 @@ test('mysql protocol: a client connects with host, port, user and password', asy
   const gw = await startMysqlGateway({ dataStore: store, port: 0 });
   const a = await rotateMysqlPassword(store, 'u1');
   const b = await rotateMysqlPassword(store, 'u2');
+  await store.createDatabase({ ownerId: 'u1', name: 'app' });
+  await store.createDatabase({ ownerId: 'u2', name: 'app' });
   let conn;
   let other;
   await assert.rejects(
@@ -94,10 +102,11 @@ test('mysql protocol: a client connects with host, port, user and password', asy
   try {
     const [version] = await conn.query('SELECT @@version_comment AS v, DATABASE() AS db, USER() AS u');
     assert.equal(version[0].v, 'Funx');
-    assert.equal(version[0].db, 'db');
+    assert.equal(version[0].db, null);
     assert.equal(version[0].u, 'u1@%');
     await conn.query('SET NAMES utf8mb4');
     await assert.rejects(conn.query('CREATE DATABASE app'), (e) => e.errno === 1044);
+    await conn.query('USE app');
     await conn.query('CREATE TABLE notes (id VARCHAR(64) NOT NULL PRIMARY KEY, title VARCHAR(255), n INT, done BOOL, meta JSON)');
     await conn.query("INSERT INTO notes (id, title, n, done, meta) VALUES ('a', 'hi', 2, 1, ?)", ['{"x":1}']);
     const [got] = await conn.query('SELECT title, n, done, meta FROM notes WHERE id = ?', ['a']);
@@ -107,7 +116,7 @@ test('mysql protocol: a client connects with host, port, user and password', asy
     assert.deepEqual(got[0].meta, { x: 1 });
     const [tables] = await conn.query('SHOW TABLES');
     assert.deepEqual(tables.map((r) => Object.values(r)[0]), ['notes']);
-    const [cols] = await conn.query("SELECT COLUMN_NAME FROM information_schema.columns WHERE TABLE_SCHEMA = 'db' AND TABLE_NAME = 'notes' ORDER BY ORDINAL_POSITION");
+    const [cols] = await conn.query("SELECT COLUMN_NAME FROM information_schema.columns WHERE TABLE_SCHEMA = 'app' AND TABLE_NAME = 'notes' ORDER BY ORDINAL_POSITION");
     assert.deepEqual(cols.map((r) => r.COLUMN_NAME), ['id', 'title', 'n', 'done', 'meta']);
     await conn.query('BEGIN');
     await conn.query("INSERT INTO notes (id, title) VALUES ('b', 'later')");
@@ -125,14 +134,15 @@ test('mysql protocol: a client connects with host, port, user and password', asy
     assert.equal(gotId[0].name, 'a');
     const [still] = await conn.query('SELECT 1 AS n');
     assert.equal(still[0].n, 1);
-    const row = await store.getRow('u1', 'db', 'notes', 'a');
+    const row = await store.getRow('u1', 'app', 'notes', 'a');
     assert.equal(row.values.title, 'hi');
     other = await mysql.createConnection(clientOpts(gw.port, b.user, b.password));
     const [dbs] = await other.query('SHOW DATABASES');
-    assert.deepEqual(dbs.map((r) => r.Database), ['db']);
+    assert.deepEqual(dbs.map((r) => r.Database), ['app']);
+    await other.query('USE app');
     const [theirs] = await other.query('SHOW TABLES');
     assert.deepEqual(theirs, []);
-    await assert.rejects(other.query('USE app'), (e) => e.errno === 1049);
+    await assert.rejects(other.query('USE nope'), (e) => e.errno === 1049);
   } finally {
     if (conn) await conn.end();
     if (other) await other.end();
@@ -144,7 +154,8 @@ test('mysql protocol: multiple statements return multiple results', async () => 
   const store = new MemoryDataStore();
   const gw = await startMysqlGateway({ dataStore: store, port: 0 });
   const account = await rotateMysqlPassword(store, 'u1');
-  const conn = await mysql.createConnection(clientOpts(gw.port, account.user, account.password, { multipleStatements: true }));
+  await store.createDatabase({ ownerId: 'u1', name: 'app' });
+  const conn = await mysql.createConnection(clientOpts(gw.port, account.user, account.password, { multipleStatements: true, database: 'app' }));
   try {
     await conn.query('CREATE TABLE notes (id VARCHAR(32) PRIMARY KEY, title VARCHAR(32))');
     const [sets] = await conn.query("INSERT INTO notes (id, title) VALUES ('a', 'one'); SELECT title FROM notes");
@@ -187,7 +198,8 @@ test('http: /v1/mysql returns a connection string and the password only on reset
     assert.equal(view.json.password_set, false);
     assert.equal(view.json.password, undefined);
     assert.equal(view.json.user, 'u1');
-    assert.equal(view.json.uri, `mysql://u1@127.0.0.1:${gw.port}/db`);
+    assert.equal(view.json.uri, `mysql://u1@127.0.0.1:${gw.port}/`);
+    assert.deepEqual(view.json.databases, []);
     const reset = await call('POST', '/v1/mysql', { token: tok('u1'), body: {} });
     assert.equal(reset.status, 200);
     assert.equal(reset.json.password_set, true);
@@ -196,12 +208,17 @@ test('http: /v1/mysql returns a connection string and the password only on reset
     const again = await call('GET', '/v1/mysql', { token: tok('u1') });
     assert.equal(again.json.password, undefined);
     assert.equal(again.json.password_set, true);
-    conn = await mysql.createConnection(clientOpts(gw.port, reset.json.user, reset.json.password));
+    const project = await call('POST', '/v1/databases', { token: tok('u1'), body: { name: 'app' } });
+    assert.equal(project.status, 201);
+    const named = await call('GET', '/v1/mysql', { token: tok('u1') });
+    assert.equal(named.json.database, 'app');
+    assert.equal(named.json.uri, `mysql://u1@127.0.0.1:${gw.port}/app`);
+    conn = await mysql.createConnection(clientOpts(gw.port, reset.json.user, reset.json.password, { database: 'app' }));
     await conn.query('CREATE TABLE notes (id VARCHAR(32) PRIMARY KEY, title VARCHAR(64))');
     await conn.query("INSERT INTO notes (id, title) VALUES ('a', 'from-mysql')");
     const listed = await call('GET', '/v1/databases', { token: tok('u1') });
-    assert.deepEqual(listed.json.databases.map((d) => d.name), ['db']);
-    const httpRow = await call('GET', '/v1/databases/db/tables/notes/rows/a', { token: tok('u1') });
+    assert.deepEqual(listed.json.databases.map((d) => d.name), ['app']);
+    const httpRow = await call('GET', '/v1/databases/app/tables/notes/rows/a', { token: tok('u1') });
     assert.equal(httpRow.json.values.title, 'from-mysql');
   } finally {
     if (conn) await conn.end();
@@ -215,9 +232,11 @@ test('mysql protocol: an application changes only host, port, user and password'
   const store = new MemoryDataStore();
   const gw = await startMysqlGateway({ dataStore: store, port: 0 });
   const account = await rotateMysqlPassword(store, 'shop');
+  await store.createDatabase({ ownerId: 'shop', name: 'shop' });
   let conn;
   try {
     conn = await mysql.createConnection(clientOpts(gw.port, account.user, account.password, {
+      database: 'shop',
       ssl: { rejectUnauthorized: false },
       dateStrings: true,
     }));
@@ -256,7 +275,7 @@ test('mysql protocol: an application changes only host, port, user and password'
     assert.equal(named[0].name, 'Ada Lovelace');
     const [idx] = await conn.query('SHOW INDEX FROM users');
     assert.ok(idx.some((r) => r.Key_name === 'email' && r.Column_name === 'email'));
-    const row = await store.getRow('shop', 'db', 'users', '1');
+    const row = await store.getRow('shop', 'shop', 'users', '1');
     assert.equal(row.values.email, 'ada@funx.test');
     assert.equal(row.pk, '1');
     const [bumped] = await conn.query('UPDATE posts SET title = CONCAT(title, ?) WHERE id = 1', ['!']);

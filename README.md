@@ -60,7 +60,7 @@ Same contract as Cloudflare Workers:
 | `ctx.passThroughOnException()` | no-op (no origin behind a worker); exceptions → 500 |
 | `wrangler.toml` `main = "src/index.js"` | honoured for the entry |
 | `.dev.vars` | `funx dev` reads it; never packaged |
-| KV, D1, R2, Durable Objects, Cron, `request.cf` | not yet. Each account has one logical database named `db` ([docs/DATA.md](docs/DATA.md)): host, port, user, password. It is not an `env` binding |
+| KV, D1, R2, Durable Objects, Cron, `request.cf` | not yet. A project name is that account's database ([docs/DATA.md](docs/DATA.md)): host, port, user, password, and the name. It is not an `env` binding |
 | global edge, ~ms cold start | **no**: one region (Hong Kong), SCF container cold start ~0.3-2 s |
 
 Several `Set-Cookie` headers, binary request/response bodies and any status code pass through.
