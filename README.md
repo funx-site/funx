@@ -97,6 +97,7 @@ console/    web console, plain static files (index.html, app.css, js/, vendor/co
 lib/        name rules, header hygiene, router map format, vars/secrets bindings (shared)
 docs/API.md funx-api reference
 docs/DATA.md logical databases: one shared table, MySQL host/port in front of it, node_id for more physical databases later
+docs/ISOLATION.md  same-account fence: namespace `funx`, database `funx`, CAM draft (not wired)
 examples/hello/ (v1 handler), examples/worker/ (Workers style)
 infra/      FRONTING.md (why SCF custom domains), tccli/ examples, deploy-router.sh
 test/       node:test, SCF API faked in memory (no cloud calls)

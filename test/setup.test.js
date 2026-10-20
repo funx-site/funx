@@ -115,7 +115,7 @@ test('mysql store: setup is one transaction, reuse and expiry are rejected, a fa
 
 test('server: worker region is ap-hongkong even when the runtime region is ap-guangzhou', () => {
   const { fromEnv } = require('../api/server');
-  const env = { TENCENTCLOUD_REGION: 'ap-guangzhou', SCF_FUNCTIONREGION: 'ap-guangzhou', FUNX_REGION: 'ap-guangzhou', FUNX_JWT_KEYS: JSON.stringify([newKey()]), FUNX_DB_HOST: '10.0.0.1', FUNX_DB_NAME: 'funx', FUNX_DB_USER: 'u', FUNX_DB_PASSWORD: 'p' };
+  const env = { TENCENTCLOUD_REGION: 'ap-guangzhou', SCF_FUNCTIONREGION: 'ap-guangzhou', FUNX_REGION: 'ap-guangzhou', FUNX_JWT_KEYS: JSON.stringify([newKey()]), FUNX_DB_HOST: '10.0.0.1', FUNX_DB_NAME: 'funx', FUNX_DB_USER: 'funx', FUNX_DB_PASSWORD: 'p' };
   const h = fromEnv(env);
   assert.equal(h.cfg.region, 'ap-hongkong');
   assert.throws(() => fromEnv({ ...env, FUNX_WORKER_REGION: 'ap-guangzhou' }), /ap-hongkong only/);
@@ -129,7 +129,7 @@ test('mysql store: health counts the platform logical tables; pool max defaults 
   failOn(/FROM funx_utbl/);
   await assert.rejects(store.health(), /boom/);
   const { poolFromEnv } = require('../api/store-mysql');
-  const p = poolFromEnv({ FUNX_DB_HOST: '127.0.0.1', FUNX_DB_PORT: '1', FUNX_DB_NAME: 'funx', FUNX_DB_USER: 'u', FUNX_DB_PASSWORD: 'p' });
+  const p = poolFromEnv({ FUNX_DB_HOST: '127.0.0.1', FUNX_DB_PORT: '1', FUNX_DB_NAME: 'funx', FUNX_DB_USER: 'funx', FUNX_DB_PASSWORD: 'p' });
   assert.equal(p.pool.config.connectionLimit, 2);
   await p.end();
 });
@@ -137,7 +137,7 @@ test('mysql store: health counts the platform logical tables; pool max defaults 
 test('server: v2 mode needs the runtime token hash with the secrets key, and drops secrets from process.env', () => {
   const { fromEnv } = require('../api/server');
   const { newSecretsKey } = require('../api/secretbox');
-  const base = { FUNX_JWT_KEYS: JSON.stringify([newKey()]), FUNX_DB_HOST: '10.0.0.1', FUNX_DB_NAME: 'funx', FUNX_DB_USER: 'u', FUNX_DB_PASSWORD: 'p' };
+  const base = { FUNX_JWT_KEYS: JSON.stringify([newKey()]), FUNX_DB_HOST: '10.0.0.1', FUNX_DB_NAME: 'funx', FUNX_DB_USER: 'funx', FUNX_DB_PASSWORD: 'p' };
   assert.throws(() => fromEnv({ ...base, FUNX_SECRETS_KEY: newSecretsKey() }), /FUNX_RUNTIME_TOKEN_SHA256/);
   process.env.FUNX_SECRETS_KEY = 'x';
   const h = fromEnv({ ...base, FUNX_SECRETS_KEY: newSecretsKey(), FUNX_RUNTIME_TOKEN_SHA256: 'a'.repeat(64) });

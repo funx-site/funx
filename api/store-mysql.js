@@ -1,12 +1,14 @@
 'use strict';
 // MySQL user store for funx-api. Accounts and setup tokens are rows in the platform logical
 // database (owner `funx`, name `platform`), in funx_udata. See docs/DATA.md.
+// The physical database name is `funx` and the account is a funx user (see lib/isolation.js).
 // Env (written by 云架构 into funx-api, never into git):
 //   FUNX_DB_HOST FUNX_DB_PORT FUNX_DB_NAME FUNX_DB_USER FUNX_DB_PASSWORD
 //   optional FUNX_DB_SSL=1 (TLS; FUNX_DB_SSL_CA = PEM of the TencentDB CA to verify the server)
 
-const { MysqlDataStore } = require('./data-store');
+const { MysqlDataStore, DATA_MIGRATIONS } = require('./data-store');
 const { DataUserStore } = require('./platform-data');
+const { assertDatabase } = require('../lib/isolation');
 
 class MysqlUserStore {
   constructor(pool, { dataStore, schemaName } = {}) {
@@ -28,6 +30,7 @@ function poolFromEnv(env = process.env) {
   const need = ['FUNX_DB_HOST', 'FUNX_DB_NAME', 'FUNX_DB_USER', 'FUNX_DB_PASSWORD'];
   const missing = need.filter((k) => !env[k]);
   if (missing.length) throw new Error(`database not configured: missing ${missing.join(', ')}`);
+  assertDatabase({ name: env.FUNX_DB_NAME, user: env.FUNX_DB_USER });
   const mysql = require('mysql2/promise');
   const ssl = env.FUNX_DB_SSL === '1' ? (env.FUNX_DB_SSL_CA ? { ca: env.FUNX_DB_SSL_CA, rejectUnauthorized: true } : { rejectUnauthorized: false }) : undefined;
   return mysql.createPool({
@@ -37,4 +40,4 @@ function poolFromEnv(env = process.env) {
   });
 }
 
-module.exports = { MysqlUserStore, poolFromEnv };
+module.exports = { MysqlUserStore, poolFromEnv, MIGRATIONS: DATA_MIGRATIONS };

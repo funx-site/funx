@@ -241,7 +241,7 @@ function storedPkFromRaw(columns, raw, code = 'bad_row') {
 function clampLimit(limit, max) {
   if (limit == null || limit === '') return Math.min(50, max);
   const n = typeof limit === 'number' ? limit : (/^[1-9]\d*$/.test(limit) ? Number(limit) : NaN);
-  if (!Number.isInteger(n) || n < 1 || n > max) throw dataError('bad_query', `limit must be an integer from 1 to ${max}`);
+  if (!Number.isInteger(n) || n < 1 || n > max) throw dataError('bad_query', `limit must be an integer in 1..${max}`);
   return n;
 }
 

@@ -1,4 +1,5 @@
 'use strict';
+const { assertNamespace, NAMESPACE } = require('../lib/isolation');
 const RUNTIME_NODE_DIR = { 'Nodejs18.15': 'node18', 'Nodejs20.19': 'node20', 'Nodejs16.13': 'node16' };
 
 function loadConfig(env = process.env) {
@@ -7,7 +8,7 @@ function loadConfig(env = process.env) {
   return {
     region: env.FUNX_REGION || 'ap-hongkong',
     uin: env.FUNX_UIN || '', // owner account id, used to build tag-API resource names
-    namespace: env.FUNX_NAMESPACE || 'default',
+    namespace: assertNamespace(env.FUNX_NAMESPACE == null ? NAMESPACE : env.FUNX_NAMESPACE),
     baseDomain: env.FUNX_BASE_DOMAIN || 'funx.run',
     certId: env.FUNX_CERT_ID || '', // SSL certificate id of the *.funx.run cert uploaded to Tencent SSL
     runtime,
