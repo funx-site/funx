@@ -17,6 +17,13 @@ export const dict = {
     logs: '日志', logsNA: '日志暂未开通', needLogin: '请先登录', open: '打开',
     setupTitle: '设置密码', setupSub: '设置后用这个邮箱和密码登录。', newPassword: '新密码', confirmPassword: '再输一次', pwMismatch: '两次输入不一样', setupSave: '设置并登录', checking: '正在检查链接',
     expiredTitle: '链接已失效', expiredSub: '这个链接已经用过或已过期（有效期 24 小时）。请找管理员重新发一个。', toLogin: '去登录',
+    homeTitle1: '写一个 fetch 函数，', homeTitle2: '发布就有网址。',
+    homeLede: '写法和 Cloudflare Workers 一样。先在浏览器里试，发布后得到一个 https 网址。',
+    homeTry: '试一下', homeWrite: '写一个', homeOpen: '我的函数', homePreview: '从函数到网址',
+    step1t: '写函数', step1d: '导出 fetch。变量用 env.名称 读取。',
+    step2t: '先试运行', step2d: '在页面里发请求，不用先发布。',
+    step3t: '发布', step3d: '得到 https://名字.funx.run。',
+    homeCli: '或者在命令行',
   },
   en: {
     workers: 'Workers', new: 'New', deploy: 'Deploy', deploying: 'Deploying', deployed: 'Deployed', copy: 'Copy', copied: 'Copied',
@@ -35,6 +42,13 @@ export const dict = {
     logs: 'Logs', logsNA: 'Logs are not available yet', needLogin: 'Please log in', open: 'Open',
     setupTitle: 'Set your password', setupSub: 'Then log in with this email and password.', newPassword: 'New password', confirmPassword: 'Repeat it', pwMismatch: 'The two entries differ', setupSave: 'Set and log in', checking: 'Checking the link',
     expiredTitle: 'This link has expired', expiredSub: 'It was already used or is more than 24 hours old. Ask an admin for a new one.', toLogin: 'Log in',
+    homeTitle1: 'Write a fetch handler,', homeTitle2: 'deploy it, get a URL.',
+    homeLede: 'The same shape as a Cloudflare Worker. Try it in the browser, then publish an HTTPS URL.',
+    homeTry: 'Try it', homeWrite: 'Write one', homeOpen: 'Your workers', homePreview: 'From a function to a URL',
+    step1t: 'Write', step1d: 'Export fetch. Read variables as env.NAME.',
+    step2t: 'Try it', step2d: 'Send a request in the page before you deploy.',
+    step3t: 'Deploy', step3d: 'You get https://name.funx.run.',
+    homeCli: 'Or from the command line',
   },
 };
 

@@ -1,8 +1,10 @@
 // Funx console: static SPA, hash routes, no build step.
-//   #/                 editor with a runnable sample (first screen)
-//   #/workers          worker list
-//   #/w/<name>         editor for a deployed worker
-//   #/w/<name>/settings  vars, secrets, disable, delete
+//   #/                          home
+//   #/new                       editor with a runnable sample
+//   #/workers                   worker list
+//   #/workers/<name>            editor for a deployed worker
+//   #/workers/<name>/settings   vars, secrets, disable, delete
+//   #/w/<name>[/settings]       old editor URL; redirects to #/workers/<name>
 //   #/login            email + password
 //   #/setup?t=<token>  one-time password setup link (token removed from the URL at once)
 import { t, getLang, setLang } from './i18n.js';
@@ -11,6 +13,7 @@ import { runInBrowser } from './runner.js';
 import { sample, isSample } from './sample.js';
 import { staticCodeHtml } from './highlight.js';
 import { isMockMode, headerHtml } from './chrome.js';
+import { resolveRoute } from './routes.js';
 
 const cfg = window.FUNX_CONFIG || {};
 const apiBase = isMockMode(cfg) ? '' : cfg.apiBase.trim();
@@ -169,27 +172,60 @@ async function setupPage() {
   };
 }
 
+// ---------- home ----------
+
+function homePage() {
+  const loggedIn = Boolean(api.session.user);
+  const snippet = 'export default {\n  async fetch() {\n    return new Response("hello from funx\\n");\n  },\n};';
+  const write = `<a class="primary btnlike" href="#/new">${loggedIn ? t('homeWrite') : t('homeTry')}</a>`;
+  const next = loggedIn
+    ? `<a class="outline btnlike" href="#/workers">${t('homeOpen')}</a>`
+    : `<a class="outline btnlike" href="#/login">${t('login')}</a>`;
+  app.innerHTML = `${header()}
+  <main class="home">
+    <section class="hero">
+      <h1><span>${t('homeTitle1')}</span><br><span>${t('homeTitle2')}</span></h1>
+      <p class="lede">${t('homeLede')}</p>
+      <div class="heroacts">${write}${next}</div>
+    </section>
+    <section class="stage" aria-label="${esc(t('homePreview'))}">
+      <div class="stage-code"><div class="code-static wrap">${staticCodeHtml(snippet)}</div></div>
+      <div class="stage-out">
+        <p class="mono host">hello.${esc(baseDomain)}</p>
+        <pre>hello from funx</pre>
+      </div>
+    </section>
+    <ol class="steps">
+      <li><span class="stepn">1</span><strong>${t('step1t')}</strong><span>${t('step1d')}</span></li>
+      <li><span class="stepn">2</span><strong>${t('step2t')}</strong><span>${t('step2d')}</span></li>
+      <li><span class="stepn">3</span><strong>${t('step3t')}</strong><span>${t('step3d')}</span></li>
+    </ol>
+    <p class="cli"><span>${t('homeCli')}</span> <code>funx deploy ./worker --name hello</code></p>
+  </main>`;
+  bindHeader();
+}
+
 // ---------- list ----------
 
 async function listPage() {
   if (!api.session.token) { sessionStorage.setItem('funx.next', '#/workers'); location.hash = '#/login'; return; }
-  const shell = (body) => `${header({ actions: `<a class="primary btnlike" href="#/">${t('new')}</a>` })}
+  const shell = (body) => `${header({ actions: `<a class="primary btnlike" href="#/new">${t('new')}</a>` })}
     <main class="page"><div class="pagehead"><h1>${t('workers')}</h1></div>${body}</main>`;
   app.innerHTML = shell(`<div class="table skeleton" aria-busy="true">${'<div class="row sk"></div>'.repeat(3)}</div>`);
   bindHeader();
   let rows;
   try { rows = await api.list(); } catch (e) { app.innerHTML = shell(`<p class="formerr">${icon.warn}<span>${esc(errText(e))}</span></p>`); bindHeader(); return; }
   const body = !rows.length
-    ? `<div class="card empty"><p>${t('empty')}</p><a class="primary btnlike" href="#/">${t('emptyCta')}</a></div>`
+    ? `<div class="card empty"><p>${t('empty')}</p><a class="primary btnlike" href="#/new">${t('emptyCta')}</a></div>`
     : `<div class="table" role="table">
         <div class="row head" role="row"><span>${t('name')}</span><span>${t('url')}</span><span>${t('status')}</span><span title="UTC+8">${t('lastDeploy')}</span><span></span></div>
         ${rows.map((w) => `
         <div class="row" role="row">
-          <a class="name" href="#/w/${esc(w.name)}">${esc(w.name)}</a>
+          <a class="name" href="#/workers/${esc(w.name)}">${esc(w.name)}</a>
           <a class="mono url" href="${esc(w.url)}" target="_blank" rel="noopener">${esc(w.url.replace('https://', ''))}</a>
           <span class="state ${w.disabled ? 'off' : ''}"><i></i>${w.disabled ? t('disabled') : t('running')}</span>
           <span class="mono muted time">${fmtTime(w.last_deploy)}</span>
-          <span class="rowact"><a class="ghost small btnlike" href="#/w/${esc(w.name)}/settings">${t('settings')}</a></span>
+          <span class="rowact"><a class="ghost small btnlike" href="#/workers/${esc(w.name)}/settings">${t('settings')}</a></span>
         </div>`).join('')}
       </div>`;
   app.innerHTML = shell(body);
@@ -223,7 +259,7 @@ async function editorPage(name) {
     </span>` : '');
 
   const crumbs = name
-    ? `<span class="mono wname">${esc(name)}</span><a class="ghost small btnlike" href="#/w/${esc(name)}/settings">${t('settings')}</a>`
+    ? `<span class="mono wname">${esc(name)}</span><a class="ghost small btnlike" href="#/workers/${esc(name)}/settings">${t('settings')}</a>`
     : `<input class="mono wname-in" id="wname" value="${esc(state.name)}" placeholder="${t('namePh')}" aria-label="${t('name')}" spellcheck="false" autocomplete="off">`;
 
   app.innerHTML = `${header({ crumbs, actions: `${urlBlock()}<button class="primary deploy" id="deploy">${t('deploy')}</button>` })}
@@ -369,7 +405,7 @@ async function editorPage(name) {
 
   $('#deploy').addEventListener('click', async () => {
     const target = name || ($('#wname').value || '').trim();
-    if (!api.session.token) { saveDraft(); sessionStorage.setItem('funx.next', location.hash || '#/'); toast(t('loginToDeploy')); location.hash = '#/login'; return; }
+    if (!api.session.token) { saveDraft(); sessionStorage.setItem('funx.next', location.hash || '#/new'); toast(t('loginToDeploy')); location.hash = '#/login'; return; }
     if (!NAME_RE.test(target)) { toast(t('nameRule'), 'bad'); $('#wname')?.focus(); return; }
     const btn = $('#deploy');
     btn.disabled = true; btn.textContent = t('deploying');
@@ -380,7 +416,7 @@ async function editorPage(name) {
       btn.insertAdjacentHTML('beforebegin', urlBlock());
       bindCopy();
       toast(t('deployed'), 'ok');
-      if (!name) { localStorage.removeItem(DRAFT_KEY); history.replaceState(null, '', `#/w/${target}`); name = target; }
+      if (!name) { localStorage.removeItem(DRAFT_KEY); history.replaceState(null, '', `#/workers/${target}`); name = target; }
     } catch (e) { toast(errText(e), 'bad'); }
     btn.disabled = false; btn.textContent = t('deploy');
   });
@@ -391,11 +427,11 @@ async function editorPage(name) {
 async function settingsPage(name) {
   if (!api.session.token) { sessionStorage.setItem('funx.next', location.hash); location.hash = '#/login'; return; }
   let w;
-  const crumbs = `<a class="mono wname" href="#/w/${esc(name)}">${esc(name)}</a>`;
+  const crumbs = `<a class="mono wname" href="#/workers/${esc(name)}">${esc(name)}</a>`;
   try { w = await api.get(name); } catch (e) { app.innerHTML = `${header({ crumbs })}<main class="page"><p class="formerr">${icon.warn}<span>${esc(errText(e))}</span></p></main>`; bindHeader(); return; }
 
   const draw = () => {
-    app.innerHTML = `${header({ crumbs, actions: `<a class="primary btnlike" href="#/w/${esc(name)}">${t('editor')}</a>` })}
+    app.innerHTML = `${header({ crumbs, actions: `<a class="primary btnlike" href="#/workers/${esc(name)}">${t('editor')}</a>` })}
     <main class="page narrow">
       <div class="pagehead"><h1>${t('settings')}</h1><a class="mono muted" href="${esc(w.url)}" target="_blank" rel="noopener">${esc(w.url.replace('https://', ''))}</a></div>
 
@@ -440,14 +476,18 @@ async function settingsPage(name) {
 // ---------- router ----------
 
 function render() {
-  const h = location.hash || '#/';
-  const m = h.match(/^#\/w\/([a-z0-9-]+)(\/settings)?$/);
+  const route = resolveRoute(location.hash);
   window.scrollTo(0, 0);
-  if (h.startsWith('#/login')) return loginPage();
-  if (h.startsWith('#/setup')) return setupPage();
-  if (h.startsWith('#/workers')) return listPage();
-  if (m) return m[2] ? settingsPage(m[1]) : editorPage(m[1]);
-  return editorPage(null);
+  if (route.page === 'redirect') {
+    history.replaceState(null, '', `${location.pathname}${location.search}${route.to}`);
+    return render();
+  }
+  if (route.page === 'login') return loginPage();
+  if (route.page === 'setup') return setupPage();
+  if (route.page === 'list') return listPage();
+  if (route.page === 'editor') return editorPage(route.name);
+  if (route.page === 'settings') return settingsPage(route.name);
+  return homePage();
 }
 
 window.addEventListener('hashchange', render);

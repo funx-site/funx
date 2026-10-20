@@ -121,6 +121,40 @@ test('sample-data label only in mock mode; production config (apiBase set) never
   }
 });
 
+test('home is #/; the list stays at #/workers; old editor URLs redirect', async () => {
+  const { resolveRoute, isListHash } = await import(path.join(ROOT, 'js', 'routes.js'));
+  const { headerHtml } = await import(path.join(ROOT, 'js', 'chrome.js'));
+  const { dict } = await import(path.join(ROOT, 'js', 'i18n.js'));
+  const main = fs.readFileSync(path.join(ROOT, 'js', 'main.js'), 'utf8');
+  const i18n = fs.readFileSync(path.join(ROOT, 'js', 'i18n.js'), 'utf8');
+  assert.deepEqual(resolveRoute('#/'), { page: 'home' });
+  assert.deepEqual(resolveRoute(''), { page: 'home' });
+  assert.deepEqual(resolveRoute('#/workers'), { page: 'list' });
+  assert.deepEqual(resolveRoute('#/workers/'), { page: 'list' });
+  assert.deepEqual(resolveRoute('#/new'), { page: 'editor', name: null });
+  assert.deepEqual(resolveRoute('#/workers/hello'), { page: 'editor', name: 'hello' });
+  assert.deepEqual(resolveRoute('#/workers/time-api/settings'), { page: 'settings', name: 'time-api' });
+  assert.deepEqual(resolveRoute('#/w/hello'), { page: 'redirect', to: '#/workers/hello' });
+  assert.deepEqual(resolveRoute('#/w/hello/settings'), { page: 'redirect', to: '#/workers/hello/settings' });
+  assert.deepEqual(resolveRoute('#/login'), { page: 'login' });
+  assert.deepEqual(resolveRoute('#/setup?t=abc'), { page: 'setup' });
+  assert.equal(isListHash('#/workers'), true);
+  assert.equal(isListHash('#/workers/hello'), false);
+  assert.equal(isListHash('#/'), false);
+  assert.equal(isListHash('#/new'), false);
+  const t = (k) => dict.zh[k];
+  const nav = (html) => html.match(/<nav class="nav">([\s\S]*?)<\/nav>/)[1];
+  assert.match(nav(headerHtml({ t, lang: 'zh', mock: false, user: { email: 'a@b.c' }, hash: '#/workers' })), /href="#\/workers" class="on"/);
+  assert.match(nav(headerHtml({ t, lang: 'zh', mock: false, user: { email: 'a@b.c' }, hash: '#/' })), /href="#\/workers">/);
+  assert.match(main, /function homePage/);
+  assert.match(main, /href="#\/new"/);
+  assert.match(main, /href="#\/workers\/\$\{esc\(w\.name\)\}"/);
+  assert.ok(!/href="#\/w\//.test(main), 'editor links use #/workers/:name');
+  for (const k of ['homeTitle1', 'homeTitle2', 'homeLede', 'homeTry', 'homeWrite', 'step1t', 'homeCli']) {
+    assert.equal((i18n.match(new RegExp(`${k}:`, 'g')) || []).length, 2, k);
+  }
+});
+
 test('logged-out header (setup / expired link): wordmark + language toggle only', async () => {
   const { headerHtml } = await import(path.join(ROOT, 'js', 'chrome.js'));
   const { dict } = await import(path.join(ROOT, 'js', 'i18n.js'));
@@ -135,7 +169,7 @@ test('logged-out header (setup / expired link): wordmark + language toggle only'
     }
   }
   const main = fs.readFileSync(path.join(ROOT, 'js', 'main.js'), 'utf8');
-  const setup = main.slice(main.indexOf('function expiredPage'), main.indexOf('// ---------- list'));
+  const setup = main.slice(main.indexOf('function expiredPage'), main.indexOf('// ---------- home'));
   assert.ok(!/header\(\)/.test(setup), 'setup/expired pages use the minimal header');
   assert.match(setup, /autocomplete="username"/);
   assert.equal((setup.match(/autocomplete="new-password"/g) || []).length, 2);
